@@ -6,6 +6,11 @@ add_executable(bulk_loading mix/bulk_loading.cpp)
 target_link_libraries(bulk_loading leanstore Threads::Threads)
 target_include_directories(bulk_loading PRIVATE ${SHARED_INCLUDE_DIRECTORY})
 
+add_executable(page_store_server page_store_server/rpc_server.cpp)
+target_link_libraries(page_store_server leanstore Threads::Threads)
+target_include_directories(page_store_server PRIVATE ${SHARED_INCLUDE_DIRECTORY})
+
+
 add_executable(ycsb ycsb/ycsb.cpp)
 target_link_libraries(ycsb leanstore Threads::Threads)
 target_include_directories(ycsb PRIVATE ${SHARED_INCLUDE_DIRECTORY})

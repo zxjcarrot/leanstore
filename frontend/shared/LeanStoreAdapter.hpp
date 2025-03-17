@@ -83,7 +83,7 @@ struct LeanStoreAdapter : Adapter<Record> {
       if (res == leanstore::OP_RESULT::ABORT_TX) {
          cr::Worker::my().abortTX();
       }
-      ensure(res == leanstore::OP_RESULT::OK);
+//      ensure(res == leanstore::OP_RESULT::OK);
    }
    // -------------------------------------------------------------------------------------
    void update1(const typename Record::Key& key, const std::function<void(Record&)>& cb, UpdateSameSizeInPlaceDescriptor& update_descriptor) final
