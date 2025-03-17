@@ -10,6 +10,14 @@ add_executable(ycsb ycsb/ycsb.cpp)
 target_link_libraries(ycsb leanstore Threads::Threads)
 target_include_directories(ycsb PRIVATE ${SHARED_INCLUDE_DIRECTORY})
 
+add_executable(page_store_server page_store_server/rpc_server.cpp)
+target_link_libraries(page_store_server leanstore Threads::Threads)
+target_include_directories(page_store_server PRIVATE ${SHARED_INCLUDE_DIRECTORY})
+
+add_executable(page_store_client page_store_client/client.cpp)
+target_link_libraries(page_store_client leanstore Threads::Threads)
+target_include_directories(page_store_client PRIVATE ${SHARED_INCLUDE_DIRECTORY})
+
 add_executable(deterministic ycsb/deterministic.cpp)
 target_link_libraries(deterministic leanstore Threads::Threads)
 target_include_directories(deterministic PRIVATE ${SHARED_INCLUDE_DIRECTORY})
