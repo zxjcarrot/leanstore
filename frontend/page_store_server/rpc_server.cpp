@@ -21,6 +21,10 @@
 #include <atomic>
 #include <cstring>
 #include <mutex>
+#include <dlfcn.h>
+
+#include "tux.h"
+
 // -------------------------------------------------------------------------------------
 DEFINE_uint32(port, 12345, "Server port");
 DEFINE_uint32(worker_count, 4, "Number of worker threads");
@@ -102,12 +106,17 @@ struct ConnectionContext {
   std::vector<char> response_buf;
   uint32_t response_bytes_written;
   
+  // Track if the current request came via TUX
+  bool received_via_tux;
+  
   ConnectionContext(int fd, uint32_t worker_id) 
     : fd(fd), state(READING_HEADER), worker_id(worker_id),
-      header_bytes_read(0), payload_bytes_read(0), response_bytes_written(0) {}
+      header_bytes_read(0), payload_bytes_read(0), response_bytes_written(0),
+      received_via_tux(false) {}
 
   ConnectionContext() : fd(-1), state(READING_HEADER), worker_id(0),
-      header_bytes_read(0), payload_bytes_read(0), response_bytes_written(0) {}
+      header_bytes_read(0), payload_bytes_read(0), response_bytes_written(0),
+      received_via_tux(false) {}
 };
 
 // Global variables
@@ -208,8 +217,277 @@ int set_nonblocking(int fd) {
   return 0;
 }
 
+
+int tux_leanstore_message_handler(int fd, struct tux_user_context* user_ctx, 
+  const struct tux_user_message* msg, 
+  void* user_state);
+
+typedef ssize_t (*libtux_send_tux_msg_t)(int fd, const struct msghdr *msg);
+libtux_send_tux_msg_t g_libtux_send_tux_msg = nullptr;
+
+// Add the function type definition for libtux_register_input_message_handler
+typedef bool (*libtux_register_input_message_handler_t)(int fd, 
+                                                       tux_input_message_handler handler, 
+                                                       void* user_state,
+                                                       tux_user_state_context_switch_out_handler ctx_out,
+                                                       tux_user_state_context_switch_in_handler ctx_in);
+
+// Add global variable for the function pointer
+libtux_register_input_message_handler_t g_libtux_register_input_message_handler = nullptr;
+
+// Add function pointer type for libtux_recv_tux_msg
+typedef ssize_t (*libtux_recv_tux_msg_t)(int fd, struct msghdr *msg);
+
+// Global variable for function pointer
+libtux_recv_tux_msg_t g_libtux_recv_tux_msg = nullptr;
+
+// Update the initialize_tux_functions function to also resolve libtux_recv_tux_msg
+bool initialize_tux_functions() {
+  // Try to load from the already loaded libraries first
+  void* handle = RTLD_DEFAULT;
+  
+  // Load existing functions
+  g_libtux_send_tux_msg = (libtux_send_tux_msg_t)dlsym(handle, "libtux_send_tux_msg");
+  g_libtux_register_input_message_handler = 
+      (libtux_register_input_message_handler_t)dlsym(handle, "libtux_register_input_message_handler");
+  g_libtux_recv_tux_msg = (libtux_recv_tux_msg_t)dlsym(handle, "libtux_recv_tux_msg");
+  
+  // If any function is not found, try explicitly loading the library
+  if (!g_libtux_send_tux_msg || !g_libtux_register_input_message_handler || !g_libtux_recv_tux_msg) {
+      handle = dlopen("libtux.so", RTLD_LAZY);
+      if (!handle) {
+          std::cerr << "Failed to load libtux.so: " << dlerror() << std::endl;
+          return false;
+      }
+      
+      if (!g_libtux_send_tux_msg) {
+          g_libtux_send_tux_msg = (libtux_send_tux_msg_t)dlsym(handle, "libtux_send_tux_msg");
+          if (!g_libtux_send_tux_msg) {
+              std::cerr << "Failed to find libtux_send_tux_msg: " << dlerror() << std::endl;
+              return false;
+          }
+      }
+      
+      if (!g_libtux_register_input_message_handler) {
+          g_libtux_register_input_message_handler = 
+              (libtux_register_input_message_handler_t)dlsym(handle, "libtux_register_input_message_handler");
+          if (!g_libtux_register_input_message_handler) {
+              std::cerr << "Failed to find libtux_register_input_message_handler: " << dlerror() << std::endl;
+              return false;
+          }
+      }
+      
+      if (!g_libtux_recv_tux_msg) {
+          g_libtux_recv_tux_msg = (libtux_recv_tux_msg_t)dlsym(handle, "libtux_recv_tux_msg");
+          if (!g_libtux_recv_tux_msg) {
+              std::cerr << "Failed to find libtux_recv_tux_msg: " << dlerror() << std::endl;
+              return false;
+          }
+      }
+  }
+  return true;
+}
+
+// Add a function to register the handler for a connection
+bool register_tux_handler(int fd) {
+    if (!g_libtux_register_input_message_handler) {
+        std::cerr << "TUX register handler function not initialized" << std::endl;
+        return false;
+    }
+    
+    // Register the handler with no user state and no context switch handlers
+    return g_libtux_register_input_message_handler(
+        fd,                         // The file descriptor
+        tux_leanstore_message_handler,  // Our message handler function
+        nullptr,                    // No user state needed
+        nullptr,                    // No context switch out handler
+        nullptr                     // No context switch in handler
+    );
+}
+// Helper function to send an error response with stack memory
+void send_tux_error_response(int fd, uint32_t request_id, uint32_t error_code, const char* error_msg) {
+  char error_buf[512];  // Stack buffer for error response
+  size_t msg_len = strlen(error_msg);
+  if (msg_len > 400) msg_len = 400; // Limit message length to fit in stack buffer
+  
+  size_t total_size = sizeof(MessageHeader) + sizeof(ErrorResponse) + msg_len;
+  
+  MessageHeader* resp_header = reinterpret_cast<MessageHeader*>(error_buf);
+  resp_header->type = ERROR_RESPONSE;
+  resp_header->request_id = request_id;
+  resp_header->payload_size = sizeof(ErrorResponse) + msg_len;
+  
+  ErrorResponse* response = reinterpret_cast<ErrorResponse*>(error_buf + sizeof(MessageHeader));
+  response->error_code = error_code;
+  
+  memcpy(error_buf + sizeof(MessageHeader) + sizeof(ErrorResponse), error_msg, msg_len);
+  
+  struct iovec iov;
+  iov.iov_base = error_buf;
+  iov.iov_len = total_size;
+  
+  struct msghdr msg_hdr;
+  memset(&msg_hdr, 0, sizeof(msg_hdr));
+  msg_hdr.msg_iov = &iov;
+  msg_hdr.msg_iovlen = 1;
+  g_libtux_send_tux_msg(fd, &msg_hdr);
+}
+
+// Helper function to send a GET response with stack memory
+void send_tux_get_response(int fd, uint32_t request_id, const BinaryPayload& result) {
+  // Use stack memory for the response
+  char response_buf[sizeof(MessageHeader) + sizeof(result.value)];
+  size_t total_size = sizeof(MessageHeader) + sizeof(result.value);
+  
+  MessageHeader* resp_header = reinterpret_cast<MessageHeader*>(response_buf);
+  resp_header->type = GET_RESPONSE;
+  resp_header->request_id = request_id;
+  resp_header->payload_size = sizeof(result.value);
+  
+  // Copy value
+  memcpy(response_buf + sizeof(MessageHeader), result.value, sizeof(result.value));
+  
+  struct iovec iov;
+  iov.iov_base = response_buf;
+  iov.iov_len = total_size;
+  
+  struct msghdr msg_hdr;
+  memset(&msg_hdr, 0, sizeof(msg_hdr));
+  msg_hdr.msg_iov = &iov;
+  msg_hdr.msg_iovlen = 1;
+  
+  g_libtux_send_tux_msg(fd, &msg_hdr);
+}
+
+// Main TUX message handler with optimized data path for GET
+int tux_leanstore_message_handler(int fd, struct tux_user_context* user_ctx, 
+                                 const struct tux_user_message* msg, 
+                                 void* user_state) {
+  // Calculate total data size
+  size_t total_data_size = 0;
+  for (int i = 0; i < msg->n_packets; i++) {
+    total_data_size += msg->packets[i].iov_len;
+  }
+  
+  // Check if we have at least a header
+  if (total_data_size < sizeof(MessageHeader)) {
+    return TUX_MESSAGE_PASS;
+  }
+  
+  // Read header into stack memory
+  MessageHeader header;
+  size_t header_bytes_read = 0;
+  
+  // Copy header data from packets
+  for (int i = 0; i < msg->n_packets && header_bytes_read < sizeof(MessageHeader); i++) {
+    size_t to_copy = std::min(sizeof(MessageHeader) - header_bytes_read, 
+                             (size_t)msg->packets[i].iov_len);
+    memcpy(((char*)&header) + header_bytes_read, msg->packets[i].iov_base, to_copy);
+    header_bytes_read += to_copy;
+  }
+  
+  if (header_bytes_read < sizeof(MessageHeader)) {
+    return TUX_MESSAGE_PASS;
+  }
+  
+  // We only handle GET requests
+  if (header.type != GET_REQUEST) {
+    return TUX_MESSAGE_PASS;
+  }
+  
+  // Verify message size
+  if (total_data_size < sizeof(MessageHeader) + header.payload_size) {
+    return TUX_MESSAGE_PASS;
+  }
+  
+  // Verify payload size for GET request
+  if (header.payload_size < sizeof(GetRequest)) {
+    send_tux_error_response(fd, header.request_id, 400, "Invalid GET request");
+    return TUX_MESSAGE_DONE;
+  }
+  
+  // Extract key from request using stack memory
+  GetRequest request;
+  size_t request_bytes_read = 0;
+  size_t header_offset = 0;
+  
+  // Find the payload start in the packets
+  for (int i = 0; i < msg->n_packets && request_bytes_read < sizeof(GetRequest); i++) {
+    if (header_offset + msg->packets[i].iov_len > sizeof(MessageHeader)) {
+      // This packet contains start of payload
+      size_t payload_start = sizeof(MessageHeader) - header_offset;
+      size_t available = msg->packets[i].iov_len - payload_start;
+      size_t to_copy = std::min(sizeof(GetRequest) - request_bytes_read, available);
+      
+      memcpy(((char*)&request) + request_bytes_read, 
+             (char*)msg->packets[i].iov_base + payload_start, 
+             to_copy);
+      request_bytes_read += to_copy;
+    } else {
+      // Still in header portion
+      header_offset += msg->packets[i].iov_len;
+    }
+  }
+  
+  if (request_bytes_read < sizeof(GetRequest)) {
+    send_tux_error_response(fd, header.request_id, 400, "Invalid GET request");
+    return TUX_MESSAGE_DONE;
+  }
+  
+  // Extract the key
+  BinaryKey key = request.key;
+  
+  // OPTIMIZATION: Pre-allocate response buffer for successful lookup
+  // This allows us to write directly from LeanStore to the response buffer
+  char response_buf[sizeof(MessageHeader) + sizeof(BinaryPayload::value)];
+  MessageHeader* resp_header = reinterpret_cast<MessageHeader*>(response_buf);
+  
+  // Setup response header for successful case
+  resp_header->type = GET_RESPONSE;
+  resp_header->request_id = header.request_id;
+  resp_header->payload_size = sizeof(BinaryPayload::value);
+  
+  // Process the lookup request
+  try {
+    bool found = false;
+    
+    // Perform database lookup - writing directly to response buffer
+    jumpmuTry() {
+      g_table->lookup1({key}, [&](const KVTable& record) {
+        // Write directly to the response buffer (zero-copy from LeanStore to response)
+        memcpy(response_buf + sizeof(MessageHeader), record.my_payload.value, sizeof(record.my_payload.value));
+        found = true;
+      });
+    } jumpmuCatch() {
+      send_tux_error_response(fd, header.request_id, 500, "Transaction aborted");
+      return TUX_MESSAGE_DONE;
+    }
+    
+    // Send appropriate response
+    if (found) {
+      // Use pre-populated response buffer
+      struct iovec iov;
+      iov.iov_base = response_buf;
+      iov.iov_len = sizeof(MessageHeader) + sizeof(BinaryPayload::value);
+      
+      struct msghdr msg_hdr;
+      memset(&msg_hdr, 0, sizeof(msg_hdr));
+      msg_hdr.msg_iov = &iov;
+      msg_hdr.msg_iovlen = 1;
+      
+      g_libtux_send_tux_msg(fd, &msg_hdr);
+    } else {
+      send_tux_error_response(fd, header.request_id, 404, "Key not found");
+    }
+  } catch (const std::exception& e) {
+    send_tux_error_response(fd, header.request_id, 500, e.what());
+  }
+  
+  return TUX_MESSAGE_DONE;
+}
 // Send an error response - updated to preserve request ID
 void send_error_response(ConnectionContext* ctx, uint32_t error_code, const std::string& message) {
+  // Prepare the error response buffer
   size_t total_size = sizeof(MessageHeader) + sizeof(ErrorResponse) + message.size();
   ctx->response_buf.resize(total_size);
   
@@ -223,7 +501,8 @@ void send_error_response(ConnectionContext* ctx, uint32_t error_code, const std:
   
   memcpy(ctx->response_buf.data() + sizeof(MessageHeader) + sizeof(ErrorResponse), 
          message.c_str(), message.size());
-         
+  
+  // Otherwise, queue for standard write handling
   ctx->response_bytes_written = 0;
   ctx->state = WRITING_RESPONSE;
 }
@@ -232,6 +511,74 @@ void send_error_response(ConnectionContext* ctx, uint32_t error_code, const std:
 bool handle_read(ConnectionContext* ctx) {
   std::lock_guard<std::mutex> lock(g_connections.get_mutex(ctx->fd));
   
+  // First, try to receive a TUX message if the function is available
+  if (g_libtux_recv_tux_msg) {
+    // Setup buffer for receiving TUX message
+    char tux_buf[4096]; // Buffer for TUX message
+    struct iovec iov;
+    iov.iov_base = tux_buf;
+    iov.iov_len = sizeof(tux_buf);
+    
+    struct msghdr msg;
+    memset(&msg, 0, sizeof(msg));
+    msg.msg_iov = &iov;
+    msg.msg_iovlen = 1;
+    
+    // Try to receive a TUX message
+    ssize_t recv_result = g_libtux_recv_tux_msg(ctx->fd, &msg);
+    
+    if (recv_result > 0) {
+      // We received a TUX message - process it directly
+      // Mark this connection as having received a TUX message
+      ctx->received_via_tux = true;
+      
+      if (recv_result < sizeof(MessageHeader)) {
+        // Message too small for header
+        send_error_response(ctx, 400, "Invalid message format");
+        return true;
+      }
+      
+      // Extract header
+      memcpy(&ctx->header, tux_buf, sizeof(MessageHeader));
+      
+      // Validate header
+      if (ctx->header.type != GET_REQUEST && ctx->header.type != PUT_REQUEST) {
+        send_error_response(ctx, 400, "Invalid request type");
+        return true;
+      }
+      
+      // Check payload size
+      if (ctx->header.payload_size > 1024 * 1024) {  // 1MB max payload
+        send_error_response(ctx, 400, "Payload too large");
+        return true;
+      }
+      
+      // Check if we have the full message
+      if (recv_result < sizeof(MessageHeader) + ctx->header.payload_size) {
+        send_error_response(ctx, 400, "Incomplete message");
+        return true;
+      }
+      
+      // Copy payload to context buffer
+      ctx->payload_buf.resize(ctx->header.payload_size);
+      memcpy(ctx->payload_buf.data(), tux_buf + sizeof(MessageHeader), ctx->header.payload_size);
+      ctx->payload_bytes_read = ctx->header.payload_size;
+      
+      // Message is complete, move to processing state
+      ctx->state = PROCESSING;
+      return true;
+    }
+    else if (recv_result == 0 || (recv_result < 0 && errno != EAGAIN && errno != EWOULDBLOCK)) {
+      // Connection closed or error
+      return false;
+    }
+    // If recv_result < 0 with EAGAIN/EWOULDBLOCK, fall through to standard read
+  }
+  
+  // Mark this connection as not having received a TUX message
+  ctx->received_via_tux = false;
+  
+  // Standard socket read handling for non-TUX cases
   if (ctx->state == READING_HEADER) {
     // Read the header
     ssize_t bytes_read = read(ctx->fd, 
@@ -301,24 +648,56 @@ bool handle_write(ConnectionContext* ctx) {
   std::lock_guard<std::mutex> lock(g_connections.get_mutex(ctx->fd));
   
   if (ctx->state == WRITING_RESPONSE) {
-    ssize_t bytes_written = write(ctx->fd, 
-                                 ctx->response_buf.data() + ctx->response_bytes_written,
-                                 ctx->response_buf.size() - ctx->response_bytes_written);
-                                 
-    if (bytes_written <= 0) {
-      if (bytes_written == 0 || errno != EAGAIN) {
-        // Connection closed or error
-        return false;
+    // Check if this connection used TUX for receiving
+    if (ctx->received_via_tux && g_libtux_send_tux_msg) {
+      // Send the response using TUX message interface
+      struct iovec iov;
+      iov.iov_base = ctx->response_buf.data();
+      iov.iov_len = ctx->response_buf.size();
+      
+      struct msghdr msg_hdr;
+      memset(&msg_hdr, 0, sizeof(msg_hdr));
+      msg_hdr.msg_iov = &iov;
+      msg_hdr.msg_iovlen = 1;
+      
+      ssize_t sent = g_libtux_send_tux_msg(ctx->fd, &msg_hdr);
+      
+      if (sent <= 0) {
+        if (sent == 0 || (errno != EAGAIN && errno != EWOULDBLOCK)) {
+          // Connection closed or error
+          return false;
+        }
+        return true;
       }
-      return true;
-    }
-    
-    ctx->response_bytes_written += bytes_written;
-    
-    if (ctx->response_bytes_written == ctx->response_buf.size()) {
+      
+      // TUX should send the whole message at once
+      ctx->response_bytes_written = ctx->response_buf.size();
+      
       // Response complete, prepare for next message
       ctx->header_bytes_read = 0;
       ctx->state = READING_HEADER;
+      return true;
+    } else {
+      // Use standard socket write for stream-oriented communication
+      ssize_t bytes_written = write(ctx->fd, 
+                                  ctx->response_buf.data() + ctx->response_bytes_written,
+                                  ctx->response_buf.size() - ctx->response_bytes_written);
+      
+      if (bytes_written <= 0) {
+        if (bytes_written == 0 || errno != EAGAIN) {
+          // Connection closed or error
+          return false;
+        }
+        return true;
+      }
+      
+      ctx->response_bytes_written += bytes_written;
+      
+      if (ctx->response_bytes_written == ctx->response_buf.size()) {
+        // Response complete, prepare for next message
+        ctx->header_bytes_read = 0;
+        ctx->state = READING_HEADER;
+      }
     }
   }
   
@@ -344,14 +723,14 @@ void process_get_request(ConnectionContext* ctx) {
     
     // START TRANSACTION - Only wrapping the database operation
     jumpmuTry() {
-      cr::Worker::my().startTX(TX_MODE::OLTP, TX_ISOLATION_LEVEL::SNAPSHOT_ISOLATION, true);
+      //cr::Worker::my().startTX(TX_MODE::OLTP, TX_ISOLATION_LEVEL::SNAPSHOT_ISOLATION, true);
       
       g_table->lookup1({key}, [&](const KVTable& record) {
         result = record.my_payload;
         found = true;
       });
       
-      cr::Worker::my().commitTX();
+      //cr::Worker::my().commitTX();
     } jumpmuCatch() {
       send_error_response(ctx, 500, "Transaction aborted");
       return;
@@ -518,7 +897,7 @@ void worker_thread_func(uint32_t worker_id) {
             process_message(ctx);
           }
           
-          if (keep_connection && (event_mask & EPOLLOUT) && ctx->state == WRITING_RESPONSE) {
+          if (keep_connection && ctx->state == WRITING_RESPONSE) {
             keep_connection = handle_write(ctx);
           }
           
@@ -619,7 +998,7 @@ void acceptor_thread_func(int server_fd) {
         
         // Add to epoll of the selected worker
         struct epoll_event ev;
-        ev.events = EPOLLIN | EPOLLET | EPOLLOUT;  // Edge-triggered
+        ev.events = EPOLLIN | EPOLLOUT | EPOLLERR | EPOLLHUP;  // Edge-triggered
         ev.data.fd = client_fd;
         
         if (epoll_ctl(g_epoll_fds[worker_id], EPOLL_CTL_ADD, client_fd, &ev) < 0) {
@@ -650,13 +1029,14 @@ void signal_handler(int signal) {
 
 // Main function
 int main(int argc, char** argv) {
+  //initialize_tux_functions();
   gflags::SetUsageMessage("LeanStore RPC Server");
   gflags::ParseCommandLineFlags(&argc, &argv, true);
   
   // Register signal handlers
   signal(SIGINT, signal_handler);
   signal(SIGTERM, signal_handler);
-  
+  signal(SIGPIPE, SIG_IGN);
   // Initialize LeanStore
   LeanStore db;
   g_db = &db;
