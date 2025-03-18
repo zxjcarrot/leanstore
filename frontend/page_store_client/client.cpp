@@ -21,9 +21,12 @@
 #include <queue>
 #include <unordered_map>
 #include <netinet/tcp.h>
+#include <dlfcn.h>
 
 #include <memory.h>
 #include <random>
+
+#include "tux.h"
 // -------------------------------------------------------------------------------------
 DEFINE_string(server, "127.0.0.1", "Server address");
 DEFINE_uint32(port, 12345, "Server port");
@@ -41,7 +44,51 @@ DEFINE_bool(debug, false, "Enable debug output");
 DEFINE_uint32(max_inflight_per_connection, 16, "Maximum in-flight requests per connection");
 DEFINE_uint64(throttle_rate, 0, "Max requests per second per thread (0 = no limit)");
 DEFINE_bool(measure_latency, true, "Track and report request latencies");
-// -------------------------------------------------------------------------------------
+DEFINE_bool(tux, false, "Use TUX message interface instead of POSIX send/recv");
+
+typedef ssize_t (*libtux_send_tux_msg_t)(int fd, const struct msghdr *msg);
+typedef ssize_t (*libtux_recv_tux_msg_t)(int fd, struct msghdr *msg);
+
+// Global function pointers
+libtux_send_tux_msg_t g_libtux_send_tux_msg = nullptr;
+libtux_recv_tux_msg_t g_libtux_recv_tux_msg = nullptr;
+
+// Function to initialize TUX interfaces
+bool initialize_tux_functions() {
+    // Try to load from the already loaded libraries first
+    void* handle = RTLD_DEFAULT;
+    
+    // Load functions
+    g_libtux_send_tux_msg = (libtux_send_tux_msg_t)dlsym(handle, "libtux_send_tux_msg");
+    g_libtux_recv_tux_msg = (libtux_recv_tux_msg_t)dlsym(handle, "libtux_recv_tux_msg");
+    
+    // If either function is not found, try explicitly loading the library
+    if (!g_libtux_send_tux_msg || !g_libtux_recv_tux_msg) {
+        handle = dlopen("libtux.so", RTLD_LAZY);
+        if (!handle) {
+            std::cerr << "Failed to load libtux.so: " << dlerror() << std::endl;
+            return false;
+        }
+        
+        if (!g_libtux_send_tux_msg) {
+            g_libtux_send_tux_msg = (libtux_send_tux_msg_t)dlsym(handle, "libtux_send_tux_msg");
+            if (!g_libtux_send_tux_msg) {
+                std::cerr << "Failed to find libtux_send_tux_msg: " << dlerror() << std::endl;
+                return false;
+            }
+        }
+        
+        if (!g_libtux_recv_tux_msg) {
+            g_libtux_recv_tux_msg = (libtux_recv_tux_msg_t)dlsym(handle, "libtux_recv_tux_msg");
+            if (!g_libtux_recv_tux_msg) {
+                std::cerr << "Failed to find libtux_recv_tux_msg: " << dlerror() << std::endl;
+                return false;
+            }
+        }
+    }
+    
+    return g_libtux_send_tux_msg && g_libtux_recv_tux_msg;
+}
 
 // Message types - must match server definitions
 enum MessageType {
@@ -516,10 +563,12 @@ private:
   
   // Request tracking
   std::unordered_map<uint32_t, PendingRequest>& pending_requests;
+  std::atomic<size_t>& active_requests;
   
+  // TUX mode flag
+  bool use_tux;
 
 public:
-std::atomic<size_t>& active_requests;
   Connection(const std::string& server_addr, uint16_t server_port,
             std::unordered_map<uint32_t, PendingRequest>& requests,
             std::atomic<size_t>& active_count)
@@ -527,7 +576,8 @@ std::atomic<size_t>& active_requests;
       send_buffer(4096), send_offset(0),
       recv_buffer(4096), recv_offset(0), recv_needed(0),
       header_received(false),
-      pending_requests(requests), active_requests(active_count) {}
+      pending_requests(requests), active_requests(active_count),
+      use_tux(FLAGS_tux && g_libtux_send_tux_msg && g_libtux_recv_tux_msg) {}
   
   ~Connection() {
     close_connection();
@@ -654,15 +704,32 @@ std::atomic<size_t>& active_requests;
       return true;
     }
     
-    // Try to send data
-    ssize_t sent = send(fd, send_buffer.data(), send_offset, 0);
+    ssize_t sent = 0;
+        
+    if (use_tux && g_libtux_send_tux_msg) {
+        // Use TUX message interface
+        struct iovec iov;
+        iov.iov_base = send_buffer.data();
+        iov.iov_len = send_offset;
+        
+        struct msghdr msg;
+        memset(&msg, 0, sizeof(msg));
+        msg.msg_iov = &iov;
+        msg.msg_iovlen = 1;
+        
+        sent = g_libtux_send_tux_msg(fd, &msg);
+    } else {
+        // Use standard POSIX send
+        sent = send(fd, send_buffer.data(), send_offset, 0);
+    }
+    
     if (sent < 0) {
       if (errno == EAGAIN || EWOULDBLOCK) {
         return true;  // Try again later
       }
       
       // Error occurred
-      if (FLAGS_debug) perror("send");
+      if (FLAGS_debug) perror(use_tux ? "libtux_send_tux_msg" : "send");
       return false;
     }
     
@@ -697,7 +764,24 @@ std::atomic<size_t>& active_requests;
           
           // Try to receive more header bytes
           ssize_t bytes_to_read = sizeof(MessageHeader) - recv_offset;
-          ssize_t received = recv(fd, recv_buffer.data() + recv_offset, bytes_to_read, 0);
+          ssize_t received = 0;
+                    
+          if (use_tux && g_libtux_recv_tux_msg) {
+              // Use TUX message interface for receiving
+              struct iovec iov;
+              iov.iov_base = recv_buffer.data() + recv_offset;
+              iov.iov_len = bytes_to_read;
+              
+              struct msghdr msg;
+              memset(&msg, 0, sizeof(msg));
+              msg.msg_iov = &iov;
+              msg.msg_iovlen = 1;
+              
+              received = g_libtux_recv_tux_msg(fd, &msg);
+          } else {
+              // Use standard POSIX recv
+              received = recv(fd, recv_buffer.data() + recv_offset, bytes_to_read, 0);
+          }
           
           if (received <= 0) {
             if (received < 0 && (errno == EAGAIN || EWOULDBLOCK)) {
@@ -706,7 +790,7 @@ std::atomic<size_t>& active_requests;
             
             // Connection closed or error
             if (received < 0) {
-              if (FLAGS_debug) perror("recv header");
+              if (FLAGS_debug) perror(use_tux ? "libtux_recv_tux_msg" : "recv header");
             } else {
               if (FLAGS_debug) std::cerr << "Connection closed by server" << std::endl;
             }
@@ -752,7 +836,24 @@ std::atomic<size_t>& active_requests;
         if (recv_offset < recv_needed) {
           // Try to receive more payload bytes
           ssize_t bytes_to_read = recv_needed - recv_offset;
-          ssize_t received = recv(fd, recv_buffer.data() + recv_offset, bytes_to_read, 0);
+          ssize_t received = 0;
+                    
+          if (use_tux && g_libtux_recv_tux_msg) {
+              // Use TUX message interface for receiving
+              struct iovec iov;
+              iov.iov_base = recv_buffer.data() + recv_offset;
+              iov.iov_len = bytes_to_read;
+              
+              struct msghdr msg;
+              memset(&msg, 0, sizeof(msg));
+              msg.msg_iov = &iov;
+              msg.msg_iovlen = 1;
+              
+              received = g_libtux_recv_tux_msg(fd, &msg);
+          } else {
+              // Use standard POSIX recv
+              received = recv(fd, recv_buffer.data() + recv_offset, bytes_to_read, 0);
+          }
           
           if (received <= 0) {
             if (received < 0 && (errno == EAGAIN || EWOULDBLOCK)) {
@@ -761,7 +862,7 @@ std::atomic<size_t>& active_requests;
             
             // Connection closed or error
             if (received < 0) {
-              if (FLAGS_debug) perror("recv payload");
+              if (FLAGS_debug) perror(use_tux ? "libtux_recv_tux_msg" : "recv payload");
             } else {
               if (FLAGS_debug) std::cerr << "Connection closed by server" << std::endl;
             }
@@ -1130,6 +1231,9 @@ bool run_loading_phase() {
   std::cout << "=== Starting Loading Phase ===" << std::endl;
   std::cout << "Keys to load: " << FLAGS_key_range << std::endl;
   std::cout << "Value size: " << FLAGS_value_size << " bytes" << std::endl;
+  if (FLAGS_tux && g_libtux_send_tux_msg && g_libtux_recv_tux_msg) {
+    std::cout << "Using TUX message interface" << std::endl;
+  }
   
   // Create a socket connection to the server
   int fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -1204,19 +1308,58 @@ bool run_loading_phase() {
     memcpy(send_buffer.data() + sizeof(header) + sizeof(PutRequest), 
            value_data.data(), FLAGS_value_size);
     
-    // Send request
+    // Send request using either TUX or standard send
     size_t total_size = sizeof(header) + header.payload_size;
-    if (send(fd, send_buffer.data(), total_size, MSG_NOSIGNAL) != static_cast<ssize_t>(total_size)) {
-      perror("send");
-      close(fd);
-      return false;
+    
+    if (FLAGS_tux && g_libtux_send_tux_msg) {
+      // Use TUX message interface
+      struct iovec iov;
+      iov.iov_base = send_buffer.data();
+      iov.iov_len = total_size;
+      
+      struct msghdr msg;
+      memset(&msg, 0, sizeof(msg));
+      msg.msg_iov = &iov;
+      msg.msg_iovlen = 1;
+      
+      if (g_libtux_send_tux_msg(fd, &msg) != static_cast<ssize_t>(total_size)) {
+        perror("libtux_send_tux_msg");
+        close(fd);
+        return false;
+      }
+    } else {
+      // Use standard POSIX send
+      if (send(fd, send_buffer.data(), total_size, MSG_NOSIGNAL) != static_cast<ssize_t>(total_size)) {
+        perror("send");
+        close(fd);
+        return false;
+      }
     }
     
     // Receive response header
-    if (recv(fd, recv_buffer.data(), sizeof(MessageHeader), MSG_WAITALL) != sizeof(MessageHeader)) {
-      perror("recv header");
-      close(fd);
-      return false;
+    if (FLAGS_tux && g_libtux_recv_tux_msg) {
+      // Use TUX message interface
+      struct iovec iov;
+      iov.iov_base = recv_buffer.data();
+      iov.iov_len = sizeof(MessageHeader);
+      
+      struct msghdr msg;
+      memset(&msg, 0, sizeof(msg));
+      msg.msg_iov = &iov;
+      msg.msg_iovlen = 1;
+      
+      if (g_libtux_recv_tux_msg(fd, &msg) != sizeof(MessageHeader)) {
+        perror("libtux_recv_tux_msg header");
+        close(fd);
+        return false;
+      }
+    } else {
+      // Use standard POSIX recv
+      if (recv(fd, recv_buffer.data(), sizeof(MessageHeader), MSG_WAITALL) != sizeof(MessageHeader)) {
+        perror("recv header");
+        close(fd);
+        return false;
+      }
     }
     
     // Parse response header
@@ -1232,12 +1375,31 @@ bool run_loading_phase() {
     
     // Receive response payload if any
     if (response_header->payload_size > 0) {
-      if (recv(fd, recv_buffer.data() + sizeof(MessageHeader), 
-               response_header->payload_size, MSG_WAITALL) != 
-              static_cast<ssize_t>(response_header->payload_size)) {
-        perror("recv payload");
-        close(fd);
-        return false;
+      if (FLAGS_tux && g_libtux_recv_tux_msg) {
+        // Use TUX message interface
+        struct iovec iov;
+        iov.iov_base = recv_buffer.data() + sizeof(MessageHeader);
+        iov.iov_len = response_header->payload_size;
+        
+        struct msghdr msg;
+        memset(&msg, 0, sizeof(msg));
+        msg.msg_iov = &iov;
+        msg.msg_iovlen = 1;
+        
+        if (g_libtux_recv_tux_msg(fd, &msg) != static_cast<ssize_t>(response_header->payload_size)) {
+          perror("libtux_recv_tux_msg payload");
+          close(fd);
+          return false;
+        }
+      } else {
+        // Use standard POSIX recv
+        if (recv(fd, recv_buffer.data() + sizeof(MessageHeader), 
+                 response_header->payload_size, MSG_WAITALL) != 
+                static_cast<ssize_t>(response_header->payload_size)) {
+          perror("recv payload");
+          close(fd);
+          return false;
+        }
       }
       
       // Check response type and status
@@ -1331,6 +1493,17 @@ int main(int argc, char** argv) {
                              std::to_string(FLAGS_runtime) + " seconds") << std::endl;
   std::cout << "===================================" << std::endl;
   
+  // Initialize TUX functions if needed
+  bool tux_available = false;
+  if (FLAGS_tux) {
+      std::cout << "TUX mode: ";
+      tux_available = initialize_tux_functions();
+      if (tux_available) {
+          std::cout << "enabled (successfully loaded TUX functions)" << std::endl;
+      } else {
+          std::cout << "DISABLED (failed to load TUX functions)" << std::endl;
+      }
+  }
 
   // In your main function, after printing configuration but before starting the benchmark:
   if (FLAGS_load) {
