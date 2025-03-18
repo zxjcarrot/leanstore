@@ -1414,7 +1414,7 @@ bool run_loading_phase() {
       const int MAX_RETRIES = 1000;
       int retries = 0;
       
-      while (!message_received && retries < MAX_RETRIES) {
+      while (!message_received) {
         received = g_libtux_recv_tux_msg(fd, &msg);
         
         if (received > 0) {
@@ -1424,7 +1424,6 @@ bool run_loading_phase() {
           if (errno == EAGAIN || errno == EWOULDBLOCK) {
             // No data yet, retry after a short sleep
             retries++;
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
             continue;
           } else if (errno == EMSGSIZE) {
             // Buffer too small
