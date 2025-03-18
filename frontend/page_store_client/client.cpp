@@ -1317,9 +1317,19 @@ bool run_loading_phase() {
   
   std::cout << "Connected to server " << FLAGS_server << ":" << FLAGS_port << std::endl;
   
+  // Set socket to non-blocking mode for TUX
+  if (FLAGS_tux && g_libtux_send_tux_msg && g_libtux_recv_tux_msg) {
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) {
+      perror("fcntl");
+      close(fd);
+      return false;
+    }
+  }
+  
   // Prepare buffers for request/response handling
   std::vector<char> send_buffer(sizeof(MessageHeader) + sizeof(PutRequest) + FLAGS_value_size);
-  std::vector<char> recv_buffer(sizeof(MessageHeader) + sizeof(PutResponse));
+  std::vector<char> recv_buffer(8192); // Larger buffer for TUX messages
   std::vector<char> value_data(FLAGS_value_size);
   
   // Statistics
@@ -1384,73 +1394,91 @@ bool run_loading_phase() {
       }
     }
     
-    // Receive response header
+    // Receive response
     if (FLAGS_tux && g_libtux_recv_tux_msg) {
-      // Use TUX message interface
+      // Use TUX message interface with polling for non-blocking socket
+      ssize_t received = 0;
+      bool message_received = false;
+      
+      // Set up for TUX receive
       struct iovec iov;
       iov.iov_base = recv_buffer.data();
-      iov.iov_len = sizeof(MessageHeader);
+      iov.iov_len = recv_buffer.size(); // Use the full buffer size
       
       struct msghdr msg;
       memset(&msg, 0, sizeof(msg));
       msg.msg_iov = &iov;
       msg.msg_iovlen = 1;
       
-      if (g_libtux_recv_tux_msg(fd, &msg) != sizeof(MessageHeader)) {
-        perror("libtux_recv_tux_msg header");
-        close(fd);
-        return false;
-      }
-    } else {
-      // Use standard POSIX recv
-      if (recv(fd, recv_buffer.data(), sizeof(MessageHeader), MSG_WAITALL) != sizeof(MessageHeader)) {
-        perror("recv header");
-        close(fd);
-        return false;
-      }
-    }
-    
-    // Parse response header
-    MessageHeader* response_header = reinterpret_cast<MessageHeader*>(recv_buffer.data());
-    
-    // Verify request ID matches
-    if (response_header->request_id != key) {
-      std::cerr << "Error: Response ID " << response_header->request_id 
-                << " does not match request ID " << key << std::endl;
-      close(fd);
-      return false;
-    }
-    
-    // Receive response payload if any
-    if (response_header->payload_size > 0) {
-      if (FLAGS_tux && g_libtux_recv_tux_msg) {
-        // Use TUX message interface
-        struct iovec iov;
-        iov.iov_base = recv_buffer.data() + sizeof(MessageHeader);
-        iov.iov_len = response_header->payload_size;
+      // Poll with timeout for the response
+      const int MAX_RETRIES = 1000;
+      int retries = 0;
+      
+      while (!message_received && retries < MAX_RETRIES) {
+        received = g_libtux_recv_tux_msg(fd, &msg);
         
-        struct msghdr msg;
-        memset(&msg, 0, sizeof(msg));
-        msg.msg_iov = &iov;
-        msg.msg_iovlen = 1;
-        
-        if (g_libtux_recv_tux_msg(fd, &msg) != static_cast<ssize_t>(response_header->payload_size)) {
-          perror("libtux_recv_tux_msg payload");
-          close(fd);
-          return false;
-        }
-      } else {
-        // Use standard POSIX recv
-        if (recv(fd, recv_buffer.data() + sizeof(MessageHeader), 
-                 response_header->payload_size, MSG_WAITALL) != 
-                static_cast<ssize_t>(response_header->payload_size)) {
-          perror("recv payload");
+        if (received > 0) {
+          // We got a complete message
+          message_received = true;
+        } else if (received < 0) {
+          if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            // No data yet, retry after a short sleep
+            retries++;
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            continue;
+          } else if (errno == EMSGSIZE) {
+            // Buffer too small
+            std::cerr << "FATAL: TUX message too large for " << recv_buffer.size() 
+                      << "B buffer" << std::endl;
+            close(fd);
+            return false;
+          } else {
+            // Other error
+            perror("libtux_recv_tux_msg");
+            close(fd);
+            return false;
+          }
+        } else {
+          // Connection closed
+          std::cerr << "Connection closed by server" << std::endl;
           close(fd);
           return false;
         }
       }
       
-      // Check response type and status
+      if (!message_received) {
+        std::cerr << "Timed out waiting for response after " << MAX_RETRIES << " retries" << std::endl;
+        close(fd);
+        return false;
+      }
+      
+      // Verify we have at least a header
+      if (received < sizeof(MessageHeader)) {
+        std::cerr << "Received TUX message too small for header: " << received << " bytes" << std::endl;
+        close(fd);
+        return false;
+      }
+      
+      // Parse the header from the received message
+      MessageHeader* response_header = reinterpret_cast<MessageHeader*>(recv_buffer.data());
+      
+      // Verify request ID matches
+      if (response_header->request_id != key) {
+        std::cerr << "Error: Response ID " << response_header->request_id 
+                  << " does not match request ID " << key << std::endl;
+        close(fd);
+        return false;
+      }
+      
+      // Verify we received the complete message
+      if (received < sizeof(MessageHeader) + response_header->payload_size) {
+        std::cerr << "Incomplete TUX message: received " << received << " bytes, expected " 
+                  << sizeof(MessageHeader) + response_header->payload_size << std::endl;
+        close(fd);
+        return false;
+      }
+      
+      // Process the response
       if (response_header->type == PUT_RESPONSE) {
         PutResponse* response = reinterpret_cast<PutResponse*>(
             recv_buffer.data() + sizeof(MessageHeader));
@@ -1475,6 +1503,63 @@ bool run_loading_phase() {
           }
           std::cerr << "Error loading key " << key << ": code=" << error->error_code
                     << ", message=" << error_msg << std::endl;
+        }
+      }
+    } else {
+      // Standard POSIX receive (unchanged)
+      if (recv(fd, recv_buffer.data(), sizeof(MessageHeader), MSG_WAITALL) != sizeof(MessageHeader)) {
+        perror("recv header");
+        close(fd);
+        return false;
+      }
+      
+      // Parse response header
+      MessageHeader* response_header = reinterpret_cast<MessageHeader*>(recv_buffer.data());
+      
+      // Verify request ID matches
+      if (response_header->request_id != key) {
+        std::cerr << "Error: Response ID " << response_header->request_id 
+                  << " does not match request ID " << key << std::endl;
+        close(fd);
+        return false;
+      }
+      
+      // Receive response payload if any
+      if (response_header->payload_size > 0) {
+        if (recv(fd, recv_buffer.data() + sizeof(MessageHeader), 
+                response_header->payload_size, MSG_WAITALL) != 
+                static_cast<ssize_t>(response_header->payload_size)) {
+          perror("recv payload");
+          close(fd);
+          return false;
+        }
+        
+        // Process response
+        if (response_header->type == PUT_RESPONSE) {
+          PutResponse* response = reinterpret_cast<PutResponse*>(
+              recv_buffer.data() + sizeof(MessageHeader));
+          if (response->success) {
+            successful_loads++;
+          } else {
+            failed_loads++;
+            if (FLAGS_load_verbose) {
+              std::cerr << "Failed to put key " << key << std::endl;
+            }
+          }
+        } else if (response_header->type == ERROR_RESPONSE) {
+          failed_loads++;
+          if (FLAGS_load_verbose) {
+            ErrorResponse* error = reinterpret_cast<ErrorResponse*>(
+                recv_buffer.data() + sizeof(MessageHeader));
+            std::string error_msg;
+            if (response_header->payload_size > sizeof(ErrorResponse)) {
+              error_msg = std::string(
+                  recv_buffer.data() + sizeof(MessageHeader) + sizeof(ErrorResponse),
+                  response_header->payload_size - sizeof(ErrorResponse));
+            }
+            std::cerr << "Error loading key " << key << ": code=" << error->error_code
+                      << ", message=" << error_msg << std::endl;
+          }
         }
       }
     }
