@@ -956,7 +956,9 @@ private:
   }
   
   // Track bytes received for this request
-  it->second.bytes_received = sizeof(MessageHeader) + recv_needed;
+  // For TUX path, recv_needed may not accurately represent the payload size
+  // Use the size from the header instead
+  it->second.bytes_received = sizeof(MessageHeader) + current_header.payload_size;
   
   bool success = false;
   
@@ -968,12 +970,12 @@ private:
     }
   } else if (current_header.type == PUT_RESPONSE) {
     // PUT response - check the success flag
-    if (it->second.request_type == PUT_REQUEST && recv_needed >= sizeof(PutResponse)) {
+    if (it->second.request_type == PUT_REQUEST && current_header.payload_size >= sizeof(PutResponse)) {
       PutResponse* response = reinterpret_cast<PutResponse*>(recv_buffer.data());
       success = (response->success != 0);
     }
   } else if (current_header.type == ERROR_RESPONSE) {
-    // Error response handling (unchanged)...
+    // Error response handling
     success = false;
   }
   
