@@ -580,7 +580,7 @@ public:
       use_tux(FLAGS_tux && g_libtux_send_tux_msg && g_libtux_recv_tux_msg) {}
   
   ~Connection() {
-    close_connection();
+    //close_connection();
   }
 
   int get_fd() const { return fd; }
@@ -1170,9 +1170,10 @@ public:
           epoll_ctl(epoll_fd, EPOLL_CTL_DEL, conn->get_fd(), nullptr);
           
           // Reconnect
-          if (conn->connect_to_server()) {
-            add_to_epoll(conn);
-          }
+          // if (conn->connect_to_server()) {
+          //   add_to_epoll(conn);
+          // }
+          continue;
         } else {
           // Update epoll registration if needed
           update_epoll(conn);
@@ -1195,6 +1196,8 @@ public:
     } else {
       key = leanstore::utils::RandomGenerator::getRandU64(0, FLAGS_key_range - 1);
     }
+
+    //printf("key %lu\n", key);
     
     // Determine operation type
     bool is_get = leanstore::utils::RandomGenerator::getRandU64(0, 99) < FLAGS_read_ratio;
@@ -1246,6 +1249,11 @@ public:
     // Increment request counter
     if (FLAGS_requests > 0) {
       request_counter.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    if (FLAGS_tux && g_libtux_send_tux_msg) {
+      // For TUX, we need to manually trigger the write event
+      conn.handle_write();
     }
   }
 };
