@@ -748,148 +748,196 @@ public:
     return true;
   }
     
-  // Try to receive data
+  // Try to receive data with simplified TUX handling
   bool handle_read(Statistics& stats) {
     if (!connected) return false;
     
     // Continue reading until we'd block or finish processing a message
     while (true) {
-      if (!header_received) {
-        // We need to receive a header
-        if (recv_offset < sizeof(MessageHeader)) {
-          // Make sure buffer is large enough
-          if (recv_buffer.size() < sizeof(MessageHeader)) {
-            recv_buffer.resize(sizeof(MessageHeader));
-          }
-          
-          // Try to receive more header bytes
-          ssize_t bytes_to_read = sizeof(MessageHeader) - recv_offset;
-          ssize_t received = 0;
-                    
-          if (use_tux && g_libtux_recv_tux_msg) {
-              // Use TUX message interface for receiving
-              struct iovec iov;
-              iov.iov_base = recv_buffer.data() + recv_offset;
-              iov.iov_len = bytes_to_read;
-              
-              struct msghdr msg;
-              memset(&msg, 0, sizeof(msg));
-              msg.msg_iov = &iov;
-              msg.msg_iovlen = 1;
-              
-              received = g_libtux_recv_tux_msg(fd, &msg);
+      if (use_tux && g_libtux_recv_tux_msg) {
+        // TUX MESSAGE INTERFACE PATH
+        // Use a fixed-size buffer for TUX messages - if a message doesn't fit, crash
+        char tux_buf[8192]; // 8KB buffer
+        
+        struct iovec iov;
+        iov.iov_base = tux_buf;
+        iov.iov_len = sizeof(tux_buf);
+        
+        struct msghdr msg;
+        memset(&msg, 0, sizeof(msg));
+        msg.msg_iov = &iov;
+        msg.msg_iovlen = 1;
+        
+        // Receive a complete message at once
+        ssize_t received = g_libtux_recv_tux_msg(fd, &msg);
+        
+        if (received < 0) {
+          if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            // No data available right now
+            return true;
+          } else if (errno == EMSGSIZE) {
+            // Message too large - crash with informative error
+            std::cerr << "FATAL: TUX message too large for 8KB buffer" << std::endl;
+            std::abort(); // Crash the program
           } else {
-              // Use standard POSIX recv
-              received = recv(fd, recv_buffer.data() + recv_offset, bytes_to_read, 0);
-          }
-          
-          if (received <= 0) {
-            if (received < 0 && (errno == EAGAIN || EWOULDBLOCK)) {
-              return true;  // No more data available right now
-            }
-            
-            // Connection closed or error
-            if (received < 0) {
-              if (FLAGS_debug) perror(use_tux ? "libtux_recv_tux_msg" : "recv header");
-            } else {
-              if (FLAGS_debug) std::cerr << "Connection closed by server" << std::endl;
-            }
+            // Other error
+            if (FLAGS_debug) perror("libtux_recv_tux_msg");
             return false;
           }
-          
-          // Update received count
-          recv_offset += received;
-          
-          // If we still don't have a complete header, return and try again later
-          if (recv_offset < sizeof(MessageHeader)) {
-            return true;
-          }
+        } else if (received == 0) {
+          // Connection closed
+          if (FLAGS_debug) std::cerr << "Connection closed by server" << std::endl;
+          return false;
         }
         
-        // We have a complete header now
-        memcpy(&current_header, recv_buffer.data(), sizeof(MessageHeader));
+        // We received a complete message - must be at least a header
+        if (received < sizeof(MessageHeader)) {
+          if (FLAGS_debug) std::cerr << "Received message too small for header" << std::endl;
+          return true;
+        }
+        
+        // Extract header
+        memcpy(&current_header, tux_buf, sizeof(MessageHeader));
+        
+        // Verify we received the complete message
+        if (received < sizeof(MessageHeader) + current_header.payload_size) {
+          if (FLAGS_debug) {
+            std::cerr << "Incomplete message: received " << received << " bytes, expected "
+                     << sizeof(MessageHeader) + current_header.payload_size << std::endl;
+          }
+          return true;
+        }
         
         if (FLAGS_debug) {
-          printf("Received header - type: %u, request_id: %u, payload_size: %u\n", 
+          printf("Received complete TUX message - type: %u, request_id: %u, payload_size: %u\n", 
                 current_header.type, current_header.request_id, current_header.payload_size);
         }
         
-        // Set state for payload reception
-        header_received = true;
-        recv_offset = 0;  // Reset for payload
-        
-        // Handle the payload part
+        // Copy payload to recv_buffer if we have a payload
         if (current_header.payload_size > 0) {
-          // Resize buffer if needed for the payload
+          // Ensure recv_buffer is large enough
           if (recv_buffer.size() < current_header.payload_size) {
             recv_buffer.resize(current_header.payload_size);
           }
-          recv_needed = current_header.payload_size;
-        } else {
-          // No payload, process the response now
-          process_response(stats);
-          header_received = false;  // Reset for next message
-          return true;
-        }
-      } else {
-        // We're receiving a payload
-        if (recv_offset < recv_needed) {
-          // Try to receive more payload bytes
-          ssize_t bytes_to_read = recv_needed - recv_offset;
-          ssize_t received = 0;
-                    
-          if (use_tux && g_libtux_recv_tux_msg) {
-              // Use TUX message interface for receiving
-              struct iovec iov;
-              iov.iov_base = recv_buffer.data() + recv_offset;
-              iov.iov_len = bytes_to_read;
-              
-              struct msghdr msg;
-              memset(&msg, 0, sizeof(msg));
-              msg.msg_iov = &iov;
-              msg.msg_iovlen = 1;
-              
-              received = g_libtux_recv_tux_msg(fd, &msg);
-          } else {
-              // Use standard POSIX recv
-              received = recv(fd, recv_buffer.data() + recv_offset, bytes_to_read, 0);
-          }
           
-          if (received <= 0) {
-            if (received < 0 && (errno == EAGAIN || EWOULDBLOCK)) {
-              return true;  // No more data available right now
-            }
-            
-            // Connection closed or error
-            if (received < 0) {
-              if (FLAGS_debug) perror(use_tux ? "libtux_recv_tux_msg" : "recv payload");
-            } else {
-              if (FLAGS_debug) std::cerr << "Connection closed by server" << std::endl;
-            }
-            return false;
-          }
-          
-          // Update received count
-          recv_offset += received;
-          
-          // If we still don't have the complete payload, return and try again later
-          if (recv_offset < recv_needed) {
-            return true;
-          }
+          // Copy payload from TUX buffer to recv_buffer
+          memcpy(recv_buffer.data(), tux_buf + sizeof(MessageHeader), current_header.payload_size);
         }
         
-        // We have the complete payload now
-        if (FLAGS_debug) {
-          printf("Received complete payload of %zu bytes for request %u\n", 
-                recv_offset, current_header.request_id);
-        }
-        
-        // Process the complete response
+        // Process the response
         process_response(stats);
         
-        // Reset state for next message
-        header_received = false;
-        recv_offset = 0;
+        // Continue with the next message
+        continue;
+        
+      } else {
+        // STANDARD SOCKET INTERFACE PATH - unchanged
+        if (!header_received) {
+          // We need to receive a header
+          if (recv_offset < sizeof(MessageHeader)) {
+            // Make sure buffer is large enough
+            if (recv_buffer.size() < sizeof(MessageHeader)) {
+              recv_buffer.resize(sizeof(MessageHeader));
+            }
+            
+            // Try to receive more header bytes
+            ssize_t bytes_to_read = sizeof(MessageHeader) - recv_offset;
+            ssize_t received = recv(fd, recv_buffer.data() + recv_offset, bytes_to_read, 0);
+            
+            if (received <= 0) {
+              if (received < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                return true;  // No more data available right now
+              }
+              
+              // Connection closed or error
+              if (received < 0) {
+                if (FLAGS_debug) perror("recv header");
+              } else {
+                if (FLAGS_debug) std::cerr << "Connection closed by server" << std::endl;
+              }
+              return false;
+            }
+            
+            // Update received count
+            recv_offset += received;
+            
+            // If we still don't have a complete header, return and try again later
+            if (recv_offset < sizeof(MessageHeader)) {
+              return true;
+            }
+          }
+          
+          // We have a complete header now
+          memcpy(&current_header, recv_buffer.data(), sizeof(MessageHeader));
+          
+          if (FLAGS_debug) {
+            printf("Received header - type: %u, request_id: %u, payload_size: %u\n", 
+                  current_header.type, current_header.request_id, current_header.payload_size);
+          }
+          
+          // Set state for payload reception
+          header_received = true;
+          recv_offset = 0;  // Reset for payload
+          
+          // Handle the payload part
+          if (current_header.payload_size > 0) {
+            // Resize buffer if needed for the payload
+            if (recv_buffer.size() < current_header.payload_size) {
+              recv_buffer.resize(current_header.payload_size);
+            }
+            recv_needed = current_header.payload_size;
+          } else {
+            // No payload, process the response now
+            process_response(stats);
+            header_received = false;  // Reset for next message
+            return true;
+          }
+        } else {
+          // We're receiving a payload
+          if (recv_offset < recv_needed) {
+            // Try to receive more payload bytes
+            ssize_t bytes_to_read = recv_needed - recv_offset;
+            ssize_t received = recv(fd, recv_buffer.data() + recv_offset, bytes_to_read, 0);
+            
+            if (received <= 0) {
+              if (received < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                return true;  // No more data available right now
+              }
+              
+              // Connection closed or error
+              if (received < 0) {
+                if (FLAGS_debug) perror("recv payload");
+              } else {
+                if (FLAGS_debug) std::cerr << "Connection closed by server" << std::endl;
+              }
+              return false;
+            }
+            
+            // Update received count
+            recv_offset += received;
+            
+            // If we still don't have the complete payload, return and try again later
+            if (recv_offset < recv_needed) {
+              return true;
+            }
+          }
+          
+          // We have the complete payload now
+          if (FLAGS_debug) {
+            printf("Received complete payload of %zu bytes for request %u\n", 
+                  recv_offset, current_header.request_id);
+          }
+          
+          // Process the complete response
+          process_response(stats);
+          
+          // Reset state for next message
+          header_received = false;
+          recv_offset = 0;
+          
+          // Break out to avoid busy loop
+          return true;
+        }
       }
     }
   }
