@@ -452,6 +452,8 @@ private:
     double avg = sum / sorted_data.size();
     
     double p50 = calculate_percentile(sorted_data, 0.5);
+    double p25 = calculate_percentile(sorted_data, 0.25);
+    double p75 = calculate_percentile(sorted_data, 0.75);
     double p90 = calculate_percentile(sorted_data, 0.9);
     double p95 = calculate_percentile(sorted_data, 0.95);
     double p99 = calculate_percentile(sorted_data, 0.99);
@@ -464,13 +466,16 @@ private:
     std::cout << std::endl;
     
     std::cout << "  Average: " << avg << std::endl;
+    
     std::cout << "  Min: " << min << std::endl;
-    std::cout << "  Max: " << max << std::endl;
+    std::cout << "  p25: " << p25 << std::endl;
     std::cout << "  p50: " << p50 << std::endl;
+    std::cout << "  p75: " << p75 << std::endl;
     std::cout << "  p90: " << p90 << std::endl;
     std::cout << "  p95: " << p95 << std::endl;
     std::cout << "  p99: " << p99 << std::endl;
     std::cout << "  p99.9: " << p999 << std::endl;
+    std::cout << "  Max: " << max << std::endl;
   }
   
   // Print latency statistics
@@ -496,7 +501,7 @@ private:
     std::sort(all_put_latencies.begin(), all_put_latencies.end());
     
     std::cout << "\n========== LATENCY STATISTICS ==========" << std::endl;
-    std::cout << std::fixed << std::setprecision(2);
+    std::cout << std::fixed << std::setprecision(4);
     
     // Print GET latency stats
     std::cout << "GET Latency (ms):" << std::endl;
