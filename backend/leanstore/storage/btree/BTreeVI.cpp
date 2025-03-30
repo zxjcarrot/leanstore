@@ -31,6 +31,12 @@ OP_RESULT BTreeVI::lookup(u8* o_key, u16 o_key_length, function<void(const u8*, 
       return ret;
    }
 }
+
+OP_RESULT BTreeVI::lookupMem(u8* o_key, u16 o_key_length, function<void(const u8*, u16)> payload_callback)
+{
+   return lookup(o_key, o_key_length, payload_callback);
+}
+
 // -------------------------------------------------------------------------------------
 OP_RESULT BTreeVI::lookupPessimistic(u8* key_buffer, const u16 key_length, function<void(const u8*, u16)> payload_callback)
 {

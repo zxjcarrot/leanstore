@@ -119,6 +119,18 @@ class BufferManager
          return resolveSwip(swip_guard, swip_value);
       }
    }
+
+   inline BufferFrame& trySuperFastResolveSwip(Guard& swip_guard, Swip<BufferFrame>& swip_value)
+   {
+      if (swip_value.isHOT()) {
+         BufferFrame& bf = swip_value.asBufferFrame();
+         swip_guard.recheck();
+         return bf;
+      } else {
+         jumpmu::jump();
+      }
+   }
+
    BufferFrame& resolveSwip(Guard& swip_guard, Swip<BufferFrame>& swip_value);
    void evictLastPage();
    void reclaimPage(BufferFrame& bf);

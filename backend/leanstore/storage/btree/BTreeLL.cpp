@@ -54,6 +54,46 @@ OP_RESULT BTreeLL::lookup(u8* key, u16 key_length, function<void(const u8*, u16)
    UNREACHABLE();
    return OP_RESULT::OTHER;
 }
+
+
+OP_RESULT BTreeLL::lookupMem(u8* key, u16 key_length, function<void(const u8*, u16)> payload_callback)
+{
+   while (true) {
+      jumpmuTry()
+      {
+         HybridPageGuard<BTreeNode> leaf;
+         findLeafCanJumpNoIO(leaf, key, key_length);
+         // -------------------------------------------------------------------------------------
+         DEBUG_BLOCK()
+         {
+            s16 sanity_check_result = leaf->compareKeyWithBoundaries(key, key_length);
+            leaf.recheck();
+            if (sanity_check_result != 0) {
+               cout << leaf->count << endl;
+            }
+            ensure(sanity_check_result == 0);
+         }
+         // -------------------------------------------------------------------------------------
+         s16 pos = leaf->lowerBound<true>(key, key_length);
+         if (pos != -1) {
+            payload_callback(leaf->getPayload(pos), leaf->getPayloadLength(pos));
+            leaf.recheck();
+            jumpmu_return OP_RESULT::OK;
+         } else {
+            leaf.recheck();
+//            raise(SIGTRAP);
+            jumpmu_return OP_RESULT::NOT_FOUND;
+         }
+      }
+      jumpmuCatch()
+      {
+         WorkerCounters::myCounters().dt_restarts_read[dt_id]++;
+      }
+      return OP_RESULT::NOT_IN_MEM;
+   }
+   UNREACHABLE();
+   return OP_RESULT::OTHER;
+}
 // -------------------------------------------------------------------------------------
 bool BTreeLL::isRangeSurelyEmpty(Slice start_key, Slice end_key)
 {

@@ -93,6 +93,31 @@ class HybridPageGuard
       // -------------------------------------------------------------------------------------
       p_guard.recheck();
    }
+
+
+   // I: Lock coupling with a fast path for aborting if the page is either not in memory, or not in hot state, or locked.
+   template <typename T2>
+   HybridPageGuard(int placeholder, HybridPageGuard<T2>& p_guard, Swip<T>& swip, const LATCH_FALLBACK_MODE if_contended = LATCH_FALLBACK_MODE::SPIN)
+       : bf(&BMC::global_bf->trySuperFastResolveSwip(p_guard.guard, swip.template cast<BufferFrame>())), guard(bf->header.latch)
+   {
+      latchAccordingToFallbackMode(guard, if_contended);
+      syncGSN();
+      jumpmu_registerDestructor();
+      // -------------------------------------------------------------------------------------
+      PARANOID_BLOCK()
+      {
+         [[maybe_unused]] DTID p_dt_id = p_guard.bf->page.dt_id, dt_id = bf->page.dt_id;
+         [[maybe_unused]] PID pid = bf->header.pid;
+         p_guard.recheck();
+         recheck();
+         if (p_dt_id != dt_id) {
+            cout << "p_dt_id != dt_id" << endl;
+            leanstore::storage::Tracing::printStatus(pid);
+         }
+      }
+      // -------------------------------------------------------------------------------------
+      p_guard.recheck();
+   }
    // I: Downgrade exclusive
    HybridPageGuard(ExclusivePageGuard<T>&&) = delete;
    HybridPageGuard& operator=(ExclusivePageGuard<T>&&)

@@ -104,6 +104,31 @@ class BTreeGeneric
       // -------------------------------------------------------------------------------------
       p_guard.unlock();
    }
+
+
+   template <LATCH_FALLBACK_MODE mode = LATCH_FALLBACK_MODE::SHARED>
+   inline void findLeafCanJumpNoIO(HybridPageGuard<BTreeNode>& target_guard, const u8* key, const u16 key_length)
+   {
+      target_guard.unlock();
+      HybridPageGuard<BTreeNode> p_guard(meta_node_bf);
+      target_guard = HybridPageGuard<BTreeNode>(0, p_guard, p_guard->upper);
+      // -------------------------------------------------------------------------------------
+      u16 volatile level = 0;
+      // -------------------------------------------------------------------------------------
+      while (!target_guard->is_leaf) {
+         WorkerCounters::myCounters().dt_inner_page[dt_id]++;
+         Swip<BTreeNode>& c_swip = target_guard->lookupInner(key, key_length);
+         p_guard = std::move(target_guard);
+         if (level == height - 1) {
+            target_guard = HybridPageGuard(0, p_guard, c_swip, mode);
+         } else {
+            target_guard = HybridPageGuard(0, p_guard, c_swip);
+         }
+         level = level + 1;
+      }
+      // -------------------------------------------------------------------------------------
+      p_guard.unlock();
+   }
    // -------------------------------------------------------------------------------------
    template <LATCH_FALLBACK_MODE mode = LATCH_FALLBACK_MODE::SHARED>
    void findLeafAndLatch(HybridPageGuard<BTreeNode>& target_guard, const u8* key, u16 key_length)

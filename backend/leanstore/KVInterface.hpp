@@ -8,7 +8,7 @@
 namespace leanstore
 {
 // -------------------------------------------------------------------------------------
-enum class OP_RESULT : u8 { OK = 0, NOT_FOUND = 1, DUPLICATE = 2, ABORT_TX = 3, NOT_ENOUGH_SPACE = 4, OTHER = 5 };
+enum class OP_RESULT : u8 { OK = 0, NOT_FOUND = 1, DUPLICATE = 2, ABORT_TX = 3, NOT_ENOUGH_SPACE = 4, NOT_IN_MEM = 5, OTHER = 6 };
 struct UpdateSameSizeInPlaceDescriptor {
    u8 count = 0;
    struct Slot {
@@ -44,6 +44,7 @@ class KVInterface
 {
   public:
    virtual OP_RESULT lookup(u8* key, u16 key_length, std::function<void(const u8*, u16)> payload_callback) = 0;
+   virtual OP_RESULT lookupMem(u8* key, u16 key_length, std::function<void(const u8*, u16)> payload_callback) = 0;
    virtual OP_RESULT insert(u8* key, u16 key_length, u8* value, u16 value_length) = 0;
    virtual OP_RESULT updateSameSizeInPlace(u8* key,
                                            u16 key_length,

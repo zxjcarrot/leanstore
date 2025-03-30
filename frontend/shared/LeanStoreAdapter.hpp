@@ -85,6 +85,25 @@ struct LeanStoreAdapter : Adapter<Record> {
       }
 //      ensure(res == leanstore::OP_RESULT::OK);
    }
+
+
+
+   OP_RESULT lookup1Mem(const typename Record::Key& key, const std::function<void(const Record&)>& cb)
+   {
+      u8 folded_key[Record::maxFoldLength()];
+      u16 folded_key_len = Record::foldKey(folded_key, key);
+      const OP_RESULT res = btree->lookupMem(folded_key, folded_key_len, [&](const u8* payload, u16 payload_length) {
+         static_cast<void>(payload_length);
+         const Record& typed_payload = *reinterpret_cast<const Record*>(payload);
+         cb(typed_payload);
+      });
+      if (res == leanstore::OP_RESULT::ABORT_TX) {
+         cr::Worker::my().abortTX();
+      }
+
+      return res;
+   }
+
    // -------------------------------------------------------------------------------------
    void update1(const typename Record::Key& key, const std::function<void(Record&)>& cb, UpdateSameSizeInPlaceDescriptor& update_descriptor) final
    {
