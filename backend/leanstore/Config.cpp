@@ -1,6 +1,6 @@
 #include "gflags/gflags.h"
 // -------------------------------------------------------------------------------------
-DEFINE_double(dram_gib, 1, "");
+DEFINE_double(dram_gib, 8, "");
 DEFINE_double(ssd_gib, 1700, "");
 DEFINE_uint32(free_pct, 1, "pct");
 DEFINE_uint32(partition_bits, 6, "bits per partition");
@@ -22,7 +22,7 @@ DEFINE_bool(profile_latency, false, "");
 DEFINE_bool(crc_check, false, "");
 // -------------------------------------------------------------------------------------
 DEFINE_uint32(worker_threads, 4, "");
-DEFINE_bool(cpu_counters, true, "Disable if HW does not have enough counters for all threads");
+DEFINE_bool(cpu_counters, false, "Disable if HW does not have enough counters for all threads");
 DEFINE_bool(pin_threads, false, "Responsibility of the driver");
 DEFINE_bool(smt, true, "Simultaneous multithreading");
 // -------------------------------------------------------------------------------------
