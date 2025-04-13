@@ -894,7 +894,7 @@ public:
             process_response(header, recv_buffer.data() + sizeof(MessageHeader), stats);
         } else {
             // Standard socket receive - read header first
-            bytes_read = recv(fd, &header, sizeof(header), MSG_DONTWAIT);
+            bytes_read = recv(fd, &header, sizeof(header), 0);
             
             if (bytes_read <= 0) {
                 return (bytes_read < 0 && (errno == EAGAIN || errno == EWOULDBLOCK));
@@ -911,7 +911,7 @@ public:
                     recv_buffer.resize(header.payload_size);
                 }
                 
-                bytes_read = recv(fd, recv_buffer.data(), header.payload_size, MSG_DONTWAIT);
+                bytes_read = recv(fd, recv_buffer.data(), header.payload_size, 0);
                 
                 if (bytes_read < 0) {
                     return (errno == EAGAIN || errno == EWOULDBLOCK);
@@ -921,7 +921,7 @@ public:
                     return true; // Incomplete payload, try again later
                 }
             }
-            //printf("Received %zu bytes from server\n", bytes_read);
+            printf("Received %zu bytes from server\n", bytes_read);
             // Process the complete response
             process_response(header, recv_buffer.data(), stats);
         }
@@ -1010,6 +1010,7 @@ public:
         
         // Remove from pending transactions
         pending_transactions.erase(it);
+        printf("Transaction %u completed: %s\n", header.request_id, success ? "Success" : "Failure");
     }
 
     // Send a payment transaction with customer lookup by name
@@ -1087,6 +1088,7 @@ public:
         
         // Send the request with the complete payload
         if (send_request_with_data(PUT_REQUEST, request_id, payload.data(), payload_size)) {
+            printf("Sent PUT request with key %u and value size %zu\n", key, value_size);
             pending_transactions.emplace(request_id, PendingTransaction(request_id, static_cast<TPCCTxType>(KV_PUT), payload_size));
             return true;
         }
@@ -1234,12 +1236,12 @@ public:
                         // Handle connection error - reconnect
                         epoll_ctl(epoll_fd, EPOLL_CTL_DEL, conn->get_fd(), nullptr);
                         
-                        if (conn->connect_to_server(FLAGS_server, FLAGS_port)) {
-                            struct epoll_event ev;
-                            ev.events = EPOLLIN;
-                            ev.data.ptr = conn;
-                            epoll_ctl(epoll_fd, EPOLL_CTL_ADD, conn->get_fd(), &ev);
-                        }
+                        // if (conn->connect_to_server(FLAGS_server, FLAGS_port)) {
+                        //     struct epoll_event ev;
+                        //     ev.events = EPOLLIN;
+                        //     ev.data.ptr = conn;
+                        //     epoll_ctl(epoll_fd, EPOLL_CTL_ADD, conn->get_fd(), &ev);
+                        // }
                     }
                 }
             }
