@@ -696,22 +696,45 @@ public:
         // Calculate total size for tracking
         size_t total_size = sizeof(header) + payload_size;
         
-        // Ensure buffer is large enough
-        if (send_buffer.size() < total_size) {
-            send_buffer.resize(total_size);
-        }
-        
-        // Copy data to buffer
-        memcpy(send_buffer.data(), &header, sizeof(header));
-        if (payload_size > 0 && payload != nullptr) {
-            memcpy(send_buffer.data() + sizeof(header), payload, payload_size);
-        }
-        
-        // Send the request
         ssize_t bytes_sent;
+        
         if (use_tux) {
-            // TUX sending code...
+            // TUX sending code using iovec array and msghdr
+            struct iovec iov[2];
+            struct msghdr msg;
+            
+            // Set up the first iovec for the header
+            iov[0].iov_base = &header;
+            iov[0].iov_len = sizeof(header);
+            
+            // Set up the second iovec for the payload, if any
+            if (payload_size > 0 && payload != nullptr) {
+                iov[1].iov_base = const_cast<void*>(payload);
+                iov[1].iov_len = payload_size;
+            }
+            
+            // Set up the message header
+            memset(&msg, 0, sizeof(msg));
+            msg.msg_iov = iov;
+            msg.msg_iovlen = (payload_size > 0 && payload != nullptr) ? 2 : 1;
+            
+            // Send the message using TUX
+            bytes_sent = g_libtux_send_tux_msg(fd, &msg);
         } else {
+            // Standard send implementation - prepare buffer first
+            
+            // Ensure buffer is large enough
+            if (send_buffer.size() < total_size) {
+                send_buffer.resize(total_size);
+            }
+            
+            // Copy data to buffer
+            memcpy(send_buffer.data(), &header, sizeof(header));
+            if (payload_size > 0 && payload != nullptr) {
+                memcpy(send_buffer.data() + sizeof(header), payload, payload_size);
+            }
+            
+            // Send the request using standard socket send
             bytes_sent = send(fd, send_buffer.data(), total_size, 0);
         }
         
