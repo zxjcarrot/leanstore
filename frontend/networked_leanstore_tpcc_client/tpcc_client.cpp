@@ -1045,7 +1045,7 @@ public:
         
         // Remove from pending transactions
         pending_transactions.erase(it);
-        printf("Transaction %u completed: %s\n", header.request_id, success ? "Success" : "Failure");
+        //printf("Transaction %u completed: %s\n", header.request_id, success ? "Success" : "Failure");
     }
 
     // Send a payment transaction with customer lookup by name
@@ -1123,7 +1123,7 @@ public:
         
         // Send the request with the complete payload
         if (send_request_with_data(PUT_REQUEST, request_id, payload.data(), payload_size)) {
-            printf("Sent PUT request with key %u and value size %zu\n", key, value_size);
+            //printf("Sent PUT request with key %u and value size %zu\n", key, value_size);
             pending_transactions.emplace(request_id, PendingTransaction(request_id, static_cast<TPCCTxType>(KV_PUT), payload_size));
             return true;
         }
@@ -1196,7 +1196,7 @@ public:
     }
     
     void run() {
-        const int MAX_EVENTS = 16;
+        const int MAX_EVENTS = 32;
         struct epoll_event events[MAX_EVENTS];
         
         size_t conn_index = 0;
@@ -1261,7 +1261,7 @@ public:
             }
             
             // Check for responses
-            int num_events = epoll_wait(epoll_fd, events, MAX_EVENTS, 1);
+            int num_events = epoll_wait(epoll_fd, events, MAX_EVENTS, 1000);
             
             for (int i = 0; i < num_events; i++) {
                 TPCCConnection* conn = static_cast<TPCCConnection*>(events[i].data.ptr);
@@ -1282,9 +1282,9 @@ public:
             }
             
             // Add a small sleep to prevent CPU spin if we have nothing to do
-            if (!can_send && num_events == 0) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(1));
-            }
+            // if (!can_send && num_events == 0) {
+            //     std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            // }
             
             // Update in-flight transaction count in statistics
             stats.set_inflight_count(pending_transactions.size());
