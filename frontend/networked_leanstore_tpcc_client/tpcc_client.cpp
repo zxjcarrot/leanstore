@@ -608,13 +608,19 @@ private:
     std::vector<char> send_buffer;
     std::vector<char> recv_buffer;
     std::unordered_map<uint32_t, PendingTransaction>& pending_transactions;
+    
+    // Add these tracking variables for partial message processing
+    bool header_read;                // Whether we've read a complete header
+    size_t payload_bytes_read;       // How many bytes of the payload we've read so far
+    MessageHeader current_header;    // Store the current header being processed
 
 public:
     TPCCConnection(const std::string& server, uint16_t port,
                   std::unordered_map<uint32_t, PendingTransaction>& transactions)
         : fd(-1), connected(false), 
           use_tux(FLAGS_tux && g_libtux_send_tux_msg && g_libtux_recv_tux_msg),
-          send_buffer(4096), recv_buffer(4096), pending_transactions(transactions) {
+          send_buffer(4096), recv_buffer(4096), pending_transactions(transactions),
+          header_read(false), payload_bytes_read(0) {
         
         connect_to_server(server, port);
     }
@@ -858,10 +864,8 @@ public:
     bool receive_responses(TPCCStatistics& stats) {
         if (!connected) return false;
         
-        MessageHeader header;
-        ssize_t bytes_read;
-        
         if (use_tux) {
+            // TUX implementation remains unchanged as it reads into the buffer directly
             // Ensure receive buffer is adequately sized
             if (recv_buffer.size() < 4096) {
                 recv_buffer.resize(4096);
@@ -876,7 +880,7 @@ public:
             msg.msg_iov = &iov;
             msg.msg_iovlen = 1;
             
-            bytes_read = g_libtux_recv_tux_msg(fd, &msg);
+            ssize_t bytes_read = g_libtux_recv_tux_msg(fd, &msg);
             
             if (bytes_read <= 0) {
                 return (bytes_read < 0 && (errno == EAGAIN || errno == EWOULDBLOCK));
@@ -888,42 +892,73 @@ public:
             }
             
             // Extract header
-            memcpy(&header, recv_buffer.data(), sizeof(MessageHeader));
+            const MessageHeader* header = reinterpret_cast<const MessageHeader*>(recv_buffer.data());
             
             // Process the complete response
-            process_response(header, recv_buffer.data() + sizeof(MessageHeader), stats);
+            process_response(*header, recv_buffer.data() + sizeof(MessageHeader), stats);
         } else {
-            // Standard socket receive - read header first
-            bytes_read = recv(fd, &header, sizeof(header), 0);
-            
-            if (bytes_read <= 0) {
-                return (bytes_read < 0 && (errno == EAGAIN || errno == EWOULDBLOCK));
-            }
-            
-            if (bytes_read < sizeof(MessageHeader)) {
-                return true; // Incomplete header, try again later
-            }
-            
-            // If we have a payload, read it
-            if (header.payload_size > 0) {
-                // Ensure receive buffer is adequately sized
-                if (recv_buffer.size() < header.payload_size) {
-                    recv_buffer.resize(header.payload_size);
-                }
-                
-                bytes_read = recv(fd, recv_buffer.data(), header.payload_size, 0);
+            // Standard socket receive - read header first if needed
+            if (!header_read) {
+                ssize_t bytes_read = recv(fd, &current_header, sizeof(current_header), 0);
                 
                 if (bytes_read < 0) {
                     return (errno == EAGAIN || errno == EWOULDBLOCK);
                 }
                 
-                if (bytes_read < header.payload_size) {
-                    return true; // Incomplete payload, try again later
+                if (bytes_read == 0) {
+                    // Connection closed
+                    return false;
+                }
+                
+                if (bytes_read < sizeof(MessageHeader)) {
+                    // Partial header received, need to read more later
+                    return true;
+                }
+                
+                // Full header received
+                header_read = true;
+                payload_bytes_read = 0;
+            }
+            
+            // At this point, we have a complete header in current_header
+            // If there's a payload, read it
+            if (current_header.payload_size > 0) {
+                // Make sure buffer is large enough for the complete payload
+                if (recv_buffer.size() < current_header.payload_size) {
+                    recv_buffer.resize(current_header.payload_size);
+                }
+                
+                // Read the remaining payload bytes
+                ssize_t bytes_read = recv(
+                    fd, 
+                    recv_buffer.data() + payload_bytes_read,
+                    current_header.payload_size - payload_bytes_read, 
+                    0);
+                
+                if (bytes_read < 0) {
+                    return (errno == EAGAIN || errno == EWOULDBLOCK);
+                }
+                
+                if (bytes_read == 0) {
+                    // Connection closed
+                    return false;
+                }
+                
+                payload_bytes_read += bytes_read;
+                
+                if (payload_bytes_read < current_header.payload_size) {
+                    // Need to read more payload bytes
+                    return true;
                 }
             }
-            printf("Received %zu bytes from server\n", bytes_read);
-            // Process the complete response
-            process_response(header, recv_buffer.data(), stats);
+            
+            // At this point we have the complete message (header + payload if any)
+            // Process the response
+            process_response(current_header, recv_buffer.data(), stats);
+            
+            // Reset state for next message
+            header_read = false;
+            payload_bytes_read = 0;
         }
         
         return true;
