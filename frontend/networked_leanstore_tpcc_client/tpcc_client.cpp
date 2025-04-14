@@ -109,7 +109,8 @@ enum MessageType {
 // Message header matching server format
 struct MessageHeader {
     uint8_t type;
-    uint8_t reserved[3];
+    uint8_t target_worker;
+    uint8_t reserved[2];
     uint32_t request_id;
     uint32_t payload_size;
 } __attribute__((packed));
@@ -247,6 +248,16 @@ struct PendingTransaction {
           start_time(std::chrono::high_resolution_clock::now()),
           request_size(req_size) {}
 };
+
+std::string get_current_time_micro() {
+    // return a formated time in hh:mm:ss:milliseconds
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    struct tm* ptm = localtime(&tv.tv_sec);
+    char buffer[32];
+    snprintf(buffer, sizeof(buffer), "%02d:%02d:%02d.%03ld", ptm->tm_hour, ptm->tm_min, ptm->tm_sec, tv.tv_usec / 1000);
+    return std::string(buffer);
+}
 
 // Statistics class for TPCC
 class TPCCStatistics {
@@ -462,10 +473,11 @@ private:
             double p50 = calculate_percentile(latencies, 0.5);
             double p95 = calculate_percentile(latencies, 0.95);
             double p99 = calculate_percentile(latencies, 0.99);
+            double p999 = calculate_percentile(latencies, 0.999);
             
             std::cout << tx_names[i] << " Latency (ms, " << latencies.size() << " samples):\n";
             std::cout << "  Min: " << min << ", Avg: " << avg << ", Max: " << max << "\n";
-            std::cout << "  p50: " << p50 << ", p95: " << p95 << ", p99: " << p99 << "\n\n";
+            std::cout << "  p50: " << p50 << ", p95: " << p95 << ", p99: " << p99 << ", p99.9: " << p999 << "\n\n";
         }
     }
 };
@@ -678,17 +690,21 @@ public:
     
     // Generic function to send a request with header and payload
     template <typename T>
-    bool send_request(uint8_t msg_type, uint32_t request_id, const T& payload) {
-        return send_request_with_data(msg_type, request_id, &payload, sizeof(T));
+    bool send_request(uint8_t msg_type, uint32_t request_id, const T& payload, uint8_t target_worker = 255) {
+        return send_request_with_data(msg_type, request_id, &payload, sizeof(T), target_worker);
     }
     
     // Send request with arbitrary data (for variable length payloads)
-    bool send_request_with_data(uint8_t msg_type, uint32_t request_id, const void* payload, size_t payload_size) {
-        if (!connected) return false;
+    bool send_request_with_data(uint8_t msg_type, uint32_t request_id, const void* payload, size_t payload_size, uint8_t target_worker = 255) {
+        if (!connected) {
+            printf("Not connected to server\n");
+            return false;
+        }
         
         // Prepare message header
         MessageHeader header;
         header.type = msg_type;
+        header.target_worker = target_worker; // -1 random worker
         header.request_id = request_id;
         header.payload_size = payload_size;
         memset(header.reserved, 0, sizeof(header.reserved));
@@ -738,6 +754,12 @@ public:
             bytes_sent = send(fd, send_buffer.data(), total_size, 0);
         }
         
+        if (bytes_sent != total_size) {
+            // Handle partial send case
+            printf("Partial send: %zd bytes sent, expected %zu bytes\n", bytes_sent, total_size);
+        }
+        // print request id , timestamp and size
+        //printf("Sent request %u at %s\n", request_id, get_current_time_micro().c_str(), total_size);
         // Return true only if we sent the entire message
         return (bytes_sent == total_size);
     }
@@ -1068,7 +1090,7 @@ public:
         
         // Remove from pending transactions
         pending_transactions.erase(it);
-        //printf("Transaction %u completed: %s\n", header.request_id, success ? "Success" : "Failure");
+        //printf("Transaction %u completed: %s at %s\n", header.request_id, success ? "Success" : "Failure", get_current_time_micro().c_str());
     }
 
     // Send a payment transaction with customer lookup by name
@@ -1128,7 +1150,7 @@ public:
     }
 
     // Send a Put request
-    bool send_put(uint32_t request_id, BinaryKey key, const char* value, size_t value_size) {
+    bool send_put(uint32_t request_id, BinaryKey key, const char* value, size_t value_size, uint8_t target_worker = 255) {
         // Calculate total size needed for the payload
         size_t payload_size = sizeof(PutRequest) + value_size;
         
@@ -1145,7 +1167,7 @@ public:
         }
         
         // Send the request with the complete payload
-        if (send_request_with_data(PUT_REQUEST, request_id, payload.data(), payload_size)) {
+        if (send_request_with_data(PUT_REQUEST, request_id, payload.data(), payload_size,target_worker)) {
             //printf("Sent PUT request with key %u and value size %zu\n", key, value_size);
             pending_transactions.emplace(request_id, PendingTransaction(request_id, static_cast<TPCCTxType>(KV_PUT), payload_size));
             return true;
@@ -1416,7 +1438,7 @@ void load_data_phase() {
             BinaryKey key = keys_sent + 1;        // Keys start at 1
             
             // Send the PUT request
-            if (conn->send_put(request_id, key, value_data, value_size)) {
+            if (conn->send_put(request_id, key, value_data, value_size, 0)) {
                 keys_sent++;
             } else {
                 std::cerr << "Failed to send PUT request during data loading." << std::endl;
