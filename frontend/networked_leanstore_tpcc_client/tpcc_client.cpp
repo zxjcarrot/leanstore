@@ -343,6 +343,7 @@ public:
         inflight_tx.store(count, std::memory_order_relaxed);
     }
     
+    // Modified print_report method with simplified output for progress reports
     void print_report(bool final = false) {
         std::lock_guard<std::mutex> lock(time_mutex);
         auto now = std::chrono::high_resolution_clock::now();
@@ -359,61 +360,47 @@ public:
                                   ((total - last_report_total) / elapsed_since_last) : 0;
         
         if (final) {
+            // Keep the detailed final statistics output
             std::cout << "\n========== FINAL TPCC STATISTICS ==========\n";
-        } else {
-            std::cout << "----- TPCC Progress Report -----\n";
-        }
-        
-        std::cout << std::fixed << std::setprecision(2);
-        std::cout << "Runtime: " << elapsed_total << "s\n";
-        std::cout << "Throughput: " << throughput << " txn/sec";
-        if (!final) {
-            std::cout << " (last " << elapsed_since_last << "s: " << interval_throughput << " txn/sec)";
-        }
-        std::cout << "\n";
-        
-        std::cout << "Total transactions: " << total;
-        if (!final) {
-            std::cout << " (In-flight: " << inflight << ")";
-        }
-        std::cout << "\n";
-        
-        std::cout << "Success rate: " << (total > 0 ? (100.0 * success / total) : 0) << "%\n";
-        
-        const char* tx_names[] = {"Payment", "Order-Status", "Delivery", "Stock-Level", "New-Order", "KV-GET", "KV-PUT"};
-        std::cout << "Transaction mix:\n";
-        
-        if (total > 0) {
-            for (int i = 0; i < 7; i++) {
-                uint64_t count = tx_counts[i].load();
-                std::cout << "  " << tx_names[i] << ": " << count 
-                          << " (" << (100.0 * count / total) << "%)\n";
-            }
-        }
-        
-        if (final && FLAGS_measure_latency) {
-            print_latency_stats();
-        }
-        
-        uint64_t req_bytes = total_request_bytes.load();
-        uint64_t resp_bytes = total_response_bytes.load();
-        uint64_t total_bytes = req_bytes + resp_bytes;
-        
-        double req_mb = req_bytes / (1024.0 * 1024.0);
-        double resp_mb = resp_bytes / (1024.0 * 1024.0);
-        double total_mb = total_bytes / (1024.0 * 1024.0);
-        
-        double bandwidth_mbps = (elapsed_total > 0) ? (total_mb / elapsed_total) : 0;
-        
-        std::cout << "\nNetwork Statistics:\n";
-        std::cout << "  Total sent: " << std::fixed << std::setprecision(2) << req_mb << " MB\n";
-        std::cout << "  Total received: " << resp_mb << " MB\n";
-        std::cout << "  Total traffic: " << total_mb << " MB\n";
-        std::cout << "  Average bandwidth: " << bandwidth_mbps << " MB/sec\n";
-        
-        if (final) {
-            std::cout << "\nDetailed Message Size Statistics by Transaction Type:\n";
+            std::cout << std::fixed << std::setprecision(2);
+            std::cout << "Runtime: " << elapsed_total << "s\n";
+            std::cout << "Throughput: " << throughput << " txn/sec\n";
+            std::cout << "Total transactions: " << total << "\n";
+            std::cout << "Success rate: " << (total > 0 ? (100.0 * success / total) : 0) << "%\n";
+            
             const char* tx_names[] = {"Payment", "Order-Status", "Delivery", "Stock-Level", "New-Order", "KV-GET", "KV-PUT"};
+            std::cout << "Transaction mix:\n";
+            
+            if (total > 0) {
+                for (int i = 0; i < 7; i++) {
+                    uint64_t count = tx_counts[i].load();
+                    std::cout << "  " << tx_names[i] << ": " << count 
+                              << " (" << (100.0 * count / total) << "%)\n";
+                }
+            }
+            
+            if (FLAGS_measure_latency) {
+                print_latency_stats();
+            }
+            
+            uint64_t req_bytes = total_request_bytes.load();
+            uint64_t resp_bytes = total_response_bytes.load();
+            uint64_t total_bytes = req_bytes + resp_bytes;
+            
+            double req_mb = req_bytes / (1024.0 * 1024.0);
+            double resp_mb = resp_bytes / (1024.0 * 1024.0);
+            double total_mb = total_bytes / (1024.0 * 1024.0);
+            
+            double bandwidth_mbps = (elapsed_total > 0) ? (total_mb / elapsed_total) : 0;
+            
+            std::cout << "\nNetwork Statistics:\n";
+            std::cout << "  Total sent: " << std::fixed << std::setprecision(2) << req_mb << " MB\n";
+            std::cout << "  Total received: " << resp_mb << " MB\n";
+            std::cout << "  Total traffic: " << total_mb << " MB\n";
+            std::cout << "  Average bandwidth: " << bandwidth_mbps << " MB/sec\n";
+            
+            std::cout << "\nDetailed Message Size Statistics by Transaction Type:\n";
+            const char* tx_names_detail[] = {"Payment", "Order-Status", "Delivery", "Stock-Level", "New-Order", "KV-GET", "KV-PUT"};
             
             for (int i = 0; i < 7; i++) {
                 uint64_t count = tx_counts[i].load();
@@ -424,12 +411,22 @@ public:
                     double avg_req_bytes = static_cast<double>(req_bytes_type) / count;
                     double avg_resp_bytes = static_cast<double>(resp_bytes_type) / count;
                     
-                    std::cout << "  " << tx_names[i] << ":\n";
+                    std::cout << "  " << tx_names_detail[i] << ":\n";
                     std::cout << "    Avg request size: " << avg_req_bytes << " bytes\n";
                     std::cout << "    Avg response size: " << avg_resp_bytes << " bytes\n";
                     std::cout << "    Total request data: " << (req_bytes_type / 1024.0 / 1024.0) << " MB\n";
                     std::cout << "    Total response data: " << (resp_bytes_type / 1024.0 / 1024.0) << " MB\n";
                 }
+            }
+        } else {
+            // Simplified progress report
+            std::cout << "=== [" << elapsed_total << "s] Progress: " 
+                      << throughput << " txn/sec (last " << elapsed_since_last << "s: " 
+                      << interval_throughput << " txn/sec) ===\n";
+            
+            // Calculate and print latency summaries if measurement is enabled
+            if (FLAGS_measure_latency) {
+                print_realtime_latency_summary();
             }
         }
         
@@ -479,6 +476,42 @@ private:
             std::cout << "  Min: " << min << ", Avg: " << avg << ", Max: " << max << "\n";
             std::cout << "  p50: " << p50 << ", p95: " << p95 << ", p99: " << p99 << ", p99.9: " << p999 << "\n\n";
         }
+    }
+
+    // Add a new method for simplified latency reporting during progress reports
+    void print_realtime_latency_summary() {
+        std::cout << "Latencies (ms) - ";
+        
+        const char* tx_names[] = {"Payment", "Order-Status", "Delivery", "Stock-Level", "New-Order", "KV-GET", "KV-PUT"};
+        bool first = true;
+        
+        for (int i = 0; i < 7; i++) {
+            std::vector<double> latencies;
+            {
+                std::lock_guard<std::mutex> lock(tx_latencies[i].mutex);
+                // Only copy last 1000 samples for efficiency
+                size_t start_idx = tx_latencies[i].latencies.size() > 1000 ? 
+                                   tx_latencies[i].latencies.size() - 1000 : 0;
+                if (start_idx < tx_latencies[i].latencies.size()) {
+                    latencies.assign(
+                        tx_latencies[i].latencies.begin() + start_idx,
+                        tx_latencies[i].latencies.end()
+                    );
+                }
+            }
+            
+            if (latencies.empty()) continue;
+            
+            std::sort(latencies.begin(), latencies.end());
+            double p99 = calculate_percentile(latencies, 0.99);
+            
+            if (!first) std::cout << ", ";
+            first = false;
+            
+            std::cout << tx_names[i] << " p99: " << std::fixed << std::setprecision(2) << p99;
+        }
+        
+        std::cout << std::endl;
     }
 };
 
