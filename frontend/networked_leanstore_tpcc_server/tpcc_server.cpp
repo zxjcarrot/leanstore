@@ -35,6 +35,7 @@ DEFINE_uint32(warehouse_count, 10, "Number of warehouses");
 DEFINE_bool(warehouse_affinity, true, "Whether to enforce warehouse affinity");
 DEFINE_bool(tpcc_remove, true, "Whether to remove processed entries");
 DEFINE_bool(order_wdc_index, true, "Whether to use order_wdc index");
+DEFINE_string(tux_mode, "none", "TUX mode: 'none', 'message', or 'stream'");
 // -------------------------------------------------------------------------------------
 using namespace leanstore;
 // Define our key type
@@ -82,6 +83,7 @@ struct MessageHeader {
 struct Message {
   MessageHeader header;
   std::vector<char> payload;
+  void * payload_ptr = nullptr;
   
   Message() {}
   
@@ -464,6 +466,7 @@ ConnectionPool g_connections;
 LeanStore* g_db;
 
 LeanStoreAdapter<KVTable>* g_table = nullptr;
+cr::CRManager * g_crm = nullptr;
 
 // TPCC adapter and related table types
 typedef LeanStoreAdapter<warehouse_t> warehouse_adapter_t;
@@ -508,6 +511,346 @@ int set_nonblocking(int fd) {
   return 0;
 }
 
+
+
+// TUX stream handler
+void tux_stream_handler(int fd, struct tux_user_context* ctx, void* user_state) {
+  g_crm->registerMeAsSpecialWorker(FLAGS_worker_threads + 1);
+  
+  // Setup a connection context for this request
+  if (!g_connections.is_active(fd)) {
+    g_connections.add_connection(fd, 0);  // Worker ID doesn't matter for TUX
+  }
+  
+  ConnectionContext* conn_ctx = g_connections.get_connection(fd);
+  if (!conn_ctx) {
+    fprintf(stderr, "Failed to get connection context for fd %d\n", fd);
+    return;  // Failed to get connection context
+  }
+  
+  conn_ctx->fd = fd;
+  
+  // Ensure the buffer has enough space for new data
+  size_t current_capacity = conn_ctx->read_buffer.capacity();
+  if (conn_ctx->read_buffer.size() < conn_ctx->bytes_read + 4096) {
+    // Resize the buffer to fit more data while preserving existing content
+    size_t new_size = std::max(current_capacity * 2, conn_ctx->bytes_read + 8192);
+    new_size = std::min(new_size, size_t(1024 * 1024)); // 1MB max
+    conn_ctx->read_buffer.resize(new_size);
+  }
+  
+  // Read directly into the connection's read buffer
+  ssize_t bytes_read = recv(
+      fd, 
+      conn_ctx->read_buffer.data() + conn_ctx->bytes_read,
+      conn_ctx->read_buffer.size() - conn_ctx->bytes_read, 
+      0);
+  
+  if (bytes_read <= 0) {
+    if (bytes_read < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+      return;  // No more data available right now
+    }
+    fprintf(stderr, "Read error or connection closed on fd %d: %s\n", fd, strerror(errno));
+    close(fd);  // Close the connection on error or EOF
+    g_connections.remove_connection(fd);
+    return;
+  }
+  
+  // Update the bytes_read counter
+  conn_ctx->bytes_read += bytes_read;
+  
+  // Process as many complete messages as we can
+  size_t processed_bytes = 0;
+  while (processed_bytes + sizeof(MessageHeader) <= conn_ctx->bytes_read) {
+    // Extract header
+    const MessageHeader* header = reinterpret_cast<const MessageHeader*>(
+        conn_ctx->read_buffer.data() + processed_bytes);
+    
+    // Validate the message type
+    if (header->type < GET_REQUEST || header->type > ORDER_STATUS_NAME_REQUEST) {
+      // Invalid message type, send error and stop processing
+      Message error_msg(ERROR_RESPONSE, 0, sizeof(ErrorResponse) + 22);
+      ErrorResponse* err = reinterpret_cast<ErrorResponse*>(error_msg.payload.data());
+      err->error_code = 400;
+      memcpy(error_msg.payload.data() + sizeof(ErrorResponse), "Invalid request type", 21);
+      
+      // Send error response
+      send(fd, &error_msg.header, sizeof(MessageHeader), 0);
+      send(fd, error_msg.payload.data(), error_msg.payload.size(), 0);
+      
+      // Clear all data since we can't reliably find the next valid message
+      conn_ctx->bytes_read = 0;
+      printf("Invalid message type %d on fd %d\n", header->type, fd);
+      exit(1);
+      return;
+    }
+    
+    // Check if we have a complete message
+    size_t message_size = sizeof(MessageHeader) + header->payload_size;
+    if (processed_bytes + message_size > conn_ctx->bytes_read) {
+      break;  // Incomplete message, wait for more data
+    }
+    
+    //printf("Processing request type %d on fd %d, read_buffer size %u, conn_ctx->bytes_read %u bytes_read from recv %u processed_bytes %u\n", header->type, fd, conn_ctx->read_buffer.size(), conn_ctx->bytes_read, bytes_read, processed_bytes);
+    
+    // Process only specific requests directly, others will return an error
+    bool handle_request = false;
+    switch (header->type) {
+      case GET_REQUEST:
+      case PUT_REQUEST:
+      case NEW_ORDER_REQUEST:
+      case ORDER_STATUS_ID_REQUEST:
+      case ORDER_STATUS_NAME_REQUEST:
+      case PAYMENT_BY_ID_REQUEST:
+      case PAYMENT_BY_NAME_REQUEST:
+        handle_request = true;
+        break;
+      default:
+        handle_request = false;
+        break;
+    }
+    
+    if (handle_request) {
+      // Create message from the buffer
+      Message request;
+      request.header = *header;
+      
+      if (header->payload_size > 0) {
+        request.payload.resize(header->payload_size);
+        memcpy(
+            request.payload.data(),
+            conn_ctx->read_buffer.data() + processed_bytes + sizeof(MessageHeader),
+            header->payload_size);
+      }
+      
+      // Extract payload pointer for convenience
+      const void* payload_ptr = request.payload.empty() ? nullptr : request.payload.data();
+      
+      // Process the request based on its type
+      switch (request.header.type) {
+        case GET_REQUEST:
+          {
+            if (request.payload.size() < sizeof(BinaryKey)) {
+              // Send error response for invalid request
+              Message error_msg(ERROR_RESPONSE, header->request_id, sizeof(ErrorResponse) + 22);
+              ErrorResponse* err = reinterpret_cast<ErrorResponse*>(error_msg.payload.data());
+              err->error_code = 400;
+              memcpy(error_msg.payload.data() + sizeof(ErrorResponse), "Invalid GET request", 20);
+              
+              // Send error response
+              send(fd, &error_msg.header, sizeof(MessageHeader), 0);
+              send(fd, error_msg.payload.data(), error_msg.payload.size(), 0);
+              break;
+            }
+            
+            // Extract key from payload
+            BinaryKey key = *reinterpret_cast<const BinaryKey*>(payload_ptr);
+            
+            // Try to get value from database
+            bool found = false;
+            BinaryPayload found_payload;
+            
+            jumpmuTry() {
+              // Use lookup1 with a lambda to check if the key exists and extract the payload
+              typename KVTable::Key k_key;
+              k_key.my_key = key;
+              
+              g_table->lookup1(k_key, [&](const KVTable& record) {
+                // Copy data from record to our value
+                found_payload = record.my_payload;
+                found = true;
+              });
+            } jumpmuCatch() {
+              found = false;
+            }
+            
+            // Send response
+            if (found) {
+              // Create GET_RESPONSE message
+              Message get_response(GET_RESPONSE, header->request_id, sizeof(found_payload));
+              
+              // Copy found payload to response payload
+              memcpy(get_response.payload.data(), &found_payload, sizeof(found_payload));
+              
+              // Send response
+              send(fd, &get_response.header, sizeof(MessageHeader), 0);
+              send(fd, get_response.payload.data(), get_response.payload.size(), 0);
+            } else {
+              // Key not found
+              Message error_msg(ERROR_RESPONSE, header->request_id, sizeof(ErrorResponse) + 13);
+              ErrorResponse* err = reinterpret_cast<ErrorResponse*>(error_msg.payload.data());
+              err->error_code = 404;
+              memcpy(error_msg.payload.data() + sizeof(ErrorResponse), "Key not found", 13);
+              
+              // Send error response
+              send(fd, &error_msg.header, sizeof(MessageHeader), 0);
+              send(fd, error_msg.payload.data(), error_msg.payload.size(), 0);
+            }
+          }
+          break;
+          
+        case PUT_REQUEST:
+          {
+            // Process PUT request similar to process_put_request
+            if (request.payload.size() <= sizeof(BinaryKey)) {
+              // Invalid request
+              Message error_msg(ERROR_RESPONSE, header->request_id, sizeof(ErrorResponse) + 32);
+              ErrorResponse* err = reinterpret_cast<ErrorResponse*>(error_msg.payload.data());
+              err->error_code = 400;
+              memcpy(error_msg.payload.data() + sizeof(ErrorResponse), "Invalid PUT request: missing value", 32);
+              
+              // Send error response
+              send(fd, &error_msg.header, sizeof(MessageHeader), 0);
+              send(fd, error_msg.payload.data(), error_msg.payload.size(), 0);
+              fprintf(stderr, "Invalid PUT request: missing value\n");
+              break;
+            }
+            
+            // Extract key from the beginning of payload
+            BinaryKey key = *reinterpret_cast<const BinaryKey*>(payload_ptr);
+            
+            // Value follows the key in the payload
+            size_t value_size = request.payload.size() - sizeof(BinaryKey);
+            const void* value_data = reinterpret_cast<const char*>(payload_ptr) + sizeof(BinaryKey);
+            //printf("PUT request for key %lu, value size %zu\n", key, value_size);
+            // Check if the value size is valid
+            if (value_size > sizeof(BinaryPayload::value)) {
+              // Value too large
+              std::string error_msg_str = "Value too large, max size: " + std::to_string(sizeof(BinaryPayload::value));
+              Message error_msg(ERROR_RESPONSE, header->request_id, sizeof(ErrorResponse) + error_msg_str.size());
+              ErrorResponse* err = reinterpret_cast<ErrorResponse*>(error_msg.payload.data());
+              err->error_code = 413;
+              memcpy(error_msg.payload.data() + sizeof(ErrorResponse), error_msg_str.c_str(), error_msg_str.size());
+              
+              // Send error response
+              send(fd, &error_msg.header, sizeof(MessageHeader), 0);
+              send(fd, error_msg.payload.data(), error_msg.payload.size(), 0);
+              break;
+            }
+            
+            bool success = false;
+            
+            // START TRANSACTION
+            jumpmuTry() {
+              cr::Worker::my().startTX(TX_MODE::OLTP, TX_ISOLATION_LEVEL::SNAPSHOT_ISOLATION, false);
+              
+              // Check if key exists
+              bool exists = false;
+              typename KVTable::Key k_key;
+              k_key.my_key = key;
+              
+              g_table->lookup1(k_key, [&](const KVTable& record) {
+                exists = true;
+              });
+              
+              if (exists) {
+                UpdateDescriptorGenerator1(tabular_update_descriptor, KVTable, my_payload);
+                // Key exists, use update
+                g_table->update1(k_key, [&](KVTable& record) {
+                  // Copy the value data into the record
+                  memcpy(record.my_payload.value, value_data, value_size);
+                }, tabular_update_descriptor);
+              } else {
+                // Key doesn't exist, insert new record
+                KVTable record;
+                // Copy the value data
+                memcpy(record.my_payload.value, value_data, value_size);
+                
+                g_table->insert(k_key, record);
+              }
+              
+              cr::Worker::my().commitTX();
+              success = true;
+            } jumpmuCatch() {
+              success = false;
+            }
+            
+            // Send response
+            if (success) {
+              // Create PUT_RESPONSE message with proper payload size
+              Message put_response(PUT_RESPONSE, header->request_id, sizeof(PutResponse));
+              
+              // Set the success flag in the payload
+              PutResponse* resp = reinterpret_cast<PutResponse*>(put_response.payload.data());
+              resp->success = 1;  // 1 means success
+              
+              // Send response
+              send(fd, &put_response.header, sizeof(MessageHeader), 0);
+              send(fd, put_response.payload.data(), put_response.payload.size(), 0);
+            } else {
+              // Failed to store value
+              Message error_msg(ERROR_RESPONSE, header->request_id, sizeof(ErrorResponse) + 19);
+              ErrorResponse* err = reinterpret_cast<ErrorResponse*>(error_msg.payload.data());
+              err->error_code = 500;
+              memcpy(error_msg.payload.data() + sizeof(ErrorResponse), "Failed to store value", 19);
+              
+              // Send error response
+              send(fd, &error_msg.header, sizeof(MessageHeader), 0);
+              send(fd, error_msg.payload.data(), error_msg.payload.size(), 0);
+            }
+          }
+          break;
+        case NEW_ORDER_REQUEST:
+        case PAYMENT_BY_ID_REQUEST:
+        case PAYMENT_BY_NAME_REQUEST:
+        case ORDER_STATUS_ID_REQUEST:
+        case ORDER_STATUS_NAME_REQUEST:
+          // Handle through the standard processing flow
+          conn_ctx->request_queue.push(std::move(request));
+          process_all_requests(conn_ctx);
+          
+          // Process all pending responses immediately
+          conn_ctx->prepare_write_data();
+          if (!conn_ctx->write_buffer.empty()) {
+            send(fd, conn_ctx->write_buffer.data(), conn_ctx->write_buffer.size(), 0);
+            conn_ctx->write_buffer.clear();
+            conn_ctx->bytes_written = 0;
+          }
+          break;
+          
+        default:
+          // Send error for unsupported request types
+          {
+            Message error_msg(ERROR_RESPONSE, header->request_id, sizeof(ErrorResponse) + 28);
+            ErrorResponse* err = reinterpret_cast<ErrorResponse*>(error_msg.payload.data());
+            err->error_code = 400;
+            memcpy(error_msg.payload.data() + sizeof(ErrorResponse), "Unsupported request in stream", 28);
+            
+            // Send error response
+            send(fd, &error_msg.header, sizeof(MessageHeader), 0);
+            send(fd, error_msg.payload.data(), error_msg.payload.size(), 0);
+          }
+          break;
+      }
+    } else {
+      // Unsupported request type in stream handler - send error
+      Message error_msg(ERROR_RESPONSE, header->request_id, sizeof(ErrorResponse) + 28);
+      ErrorResponse* err = reinterpret_cast<ErrorResponse*>(error_msg.payload.data());
+      err->error_code = 400;
+      memcpy(error_msg.payload.data() + sizeof(ErrorResponse), "Unsupported request in stream", 28);
+      
+      // Send error response
+      send(fd, &error_msg.header, sizeof(MessageHeader), 0);
+      send(fd, error_msg.payload.data(), error_msg.payload.size(), 0);
+    }
+    
+    // Move to the next message
+    processed_bytes += message_size;
+  }
+  
+  // If we processed any bytes, remove them from the buffer
+  if (processed_bytes > 0) {
+    if (processed_bytes < conn_ctx->bytes_read) {
+      // Move remaining data to the beginning of the buffer
+      memmove(conn_ctx->read_buffer.data(), 
+              conn_ctx->read_buffer.data() + processed_bytes,
+              conn_ctx->bytes_read - processed_bytes);
+      //printf("Moved %zu bytes to the beginning of the buffer\n", conn_ctx->bytes_read - processed_bytes);
+    }
+    assert(processed_bytes <= conn_ctx->bytes_read);
+    conn_ctx->bytes_read -= processed_bytes;
+  }
+}
 // TUX-related function declarations
 int tux_message_handler(int fd, struct tux_user_context* user_ctx, 
   const struct tux_user_message* msg, 
@@ -523,6 +866,14 @@ typedef bool (*libtux_register_input_message_handler_t)(int fd,
                                                        tux_user_state_context_switch_in_handler ctx_in);
 libtux_register_input_message_handler_t g_libtux_register_input_message_handler = nullptr;
 
+typedef bool (*libtux_register_input_stream_handler_t)(int fd, 
+  tux_input_stream_handler handler, 
+  void* user_state,
+  tux_user_state_context_switch_out_handler ctx_out,
+  tux_user_state_context_switch_in_handler ctx_in);
+libtux_register_input_stream_handler_t g_libtux_register_input_stream_handler = nullptr;
+
+
 typedef ssize_t (*libtux_recv_tux_msg_t)(int fd, struct msghdr *msg);
 libtux_recv_tux_msg_t g_libtux_recv_tux_msg = nullptr;
 
@@ -532,9 +883,16 @@ bool initialize_tux_functions() {
   g_libtux_send_tux_msg = (libtux_send_tux_msg_t)dlsym(handle, "libtux_send_tux_msg");
   g_libtux_register_input_message_handler = 
       (libtux_register_input_message_handler_t)dlsym(handle, "libtux_register_input_message_handler");
+  g_libtux_register_input_stream_handler = 
+      (libtux_register_input_stream_handler_t)dlsym(handle, "libtux_register_input_stream_handler");
   g_libtux_recv_tux_msg = (libtux_recv_tux_msg_t)dlsym(handle, "libtux_recv_tux_msg");
   
-  if (!g_libtux_send_tux_msg || !g_libtux_register_input_message_handler || !g_libtux_recv_tux_msg) {
+  if ((FLAGS_tux_mode != "none") && 
+      (!g_libtux_send_tux_msg || 
+       !g_libtux_register_input_message_handler || 
+       !g_libtux_recv_tux_msg || 
+       !g_libtux_register_input_stream_handler)) {
+      
       handle = dlopen("libtux.so", RTLD_LAZY);
       if (!handle) {
           std::cerr << "Failed to load libtux.so: " << dlerror() << std::endl;
@@ -557,7 +915,16 @@ bool initialize_tux_functions() {
               return false;
           }
       }
-      
+
+      if (!g_libtux_register_input_stream_handler) {
+          g_libtux_register_input_stream_handler = 
+              (libtux_register_input_stream_handler_t)dlsym(handle, "libtux_register_input_stream_handler");
+          if (!g_libtux_register_input_stream_handler) {
+              std::cerr << "Failed to find libtux_register_input_stream_handler: " << dlerror() << std::endl;
+              return false;
+          }
+      }
+
       if (!g_libtux_recv_tux_msg) {
           g_libtux_recv_tux_msg = (libtux_recv_tux_msg_t)dlsym(handle, "libtux_recv_tux_msg");
           if (!g_libtux_recv_tux_msg) {
@@ -566,6 +933,8 @@ bool initialize_tux_functions() {
           }
       }
   }
+  
+  std::cout << "TUX functions " << (FLAGS_tux_mode == "none" ? "not needed" : "successfully loaded") << std::endl;
   return true;
 }
 
@@ -577,26 +946,58 @@ void leanstore_ctx_in(void* user_state, char * user_tl_state_buffer, size_t buff
   jumpmu::restoreThreadLocalstate(user_tl_state_buffer, buffer_size);
 }
 
-bool register_tux_handler(int fd) {
-    if (!g_libtux_register_input_message_handler) {
-        std::cerr << "TUX register handler function not initialized" << std::endl;
+bool register_tux_udf(int fd) {
+    if (FLAGS_tux_mode == "none") {
+        std::cout << "TUX mode disabled, skipping handler registration for fd " << fd << std::endl;
+        return true;
+    }
+    
+    bool result = false;
+    
+    if (FLAGS_tux_mode == "message") {
+        if (!g_libtux_register_input_message_handler) {
+            std::cerr << "TUX message handler function not initialized" << std::endl;
+            return false;
+        }
+        
+        result = g_libtux_register_input_message_handler(
+            fd,
+            tux_message_handler,
+            nullptr,
+            leanstore_ctx_out,
+            leanstore_ctx_in
+        );
+        
+        if (result) {
+            std::cout << "Registered TUX message handler for fd " << fd << std::endl;
+        } else {
+            std::cerr << "Failed to register TUX message handler for fd " << fd << std::endl;
+        }
+    } else if (FLAGS_tux_mode == "stream") {
+        if (!g_libtux_register_input_stream_handler) {
+            std::cerr << "TUX stream handler function not initialized" << std::endl;
+            return false;
+        }
+        
+        result = g_libtux_register_input_stream_handler(
+            fd,
+            tux_stream_handler,
+            nullptr,
+            leanstore_ctx_out,
+            leanstore_ctx_in
+        );
+        
+        if (result) {
+            std::cout << "Registered TUX stream handler for fd " << fd << std::endl;
+        } else {
+            std::cerr << "Failed to register TUX stream handler for fd " << fd << std::endl;
+        }
+    } else {
+        std::cerr << "Invalid TUX mode: " << FLAGS_tux_mode << std::endl;
         return false;
     }
     
-    bool res = g_libtux_register_input_message_handler(
-        fd,
-        tux_message_handler,
-        nullptr,
-        leanstore_ctx_out,
-        leanstore_ctx_in
-    );
-
-    if (!res) {
-        std::cerr << "Failed to register TUX message handler" << std::endl;
-        return false;
-    }
-    std::cout << "Registered TUX message handler for fd " << fd << std::endl;
-    return true;
+    return result;
 }
 // Update the send_error_response function to use the new Message-based approach
 void send_error_response(ConnectionContext* ctx, uint32_t request_id, uint32_t error_code, const std::string& message) {
@@ -652,7 +1053,7 @@ void process_new_order_request(ConnectionContext* ctx, uint32_t request_id, cons
     bool success = false;
     
     jumpmuTry() {
-      cr::Worker::my().startTX(TX_MODE::OLTP, TX_ISOLATION_LEVEL::SNAPSHOT_ISOLATION, true);
+      cr::Worker::my().startTX(TX_MODE::OLTP, TX_ISOLATION_LEVEL::SNAPSHOT_ISOLATION, false);
       
       // Call TPCCWorkload's newOrder method
       g_tpcc_workload->newOrder(
@@ -670,7 +1071,7 @@ void process_new_order_request(ConnectionContext* ctx, uint32_t request_id, cons
       cr::Worker::my().commitTX();
       success = true;
     } jumpmuCatch() {
-      send_error_response(ctx, request_id, 500, "Transaction aborted");
+      send_error_response(ctx, request_id, 500, "Transaction aborted new_order");
       return;
     }
     
@@ -726,7 +1127,7 @@ void process_payment_by_id_request(ConnectionContext* ctx, uint32_t request_id, 
       cr::Worker::my().commitTX();
       success = true;
     } jumpmuCatch() {
-      send_error_response(ctx, request_id, 500, "Transaction aborted");
+      send_error_response(ctx, request_id, 500, "Transaction aborted payment_by_id");
       return;
     }
     
@@ -785,7 +1186,7 @@ void process_payment_by_name_request(ConnectionContext* ctx, uint32_t request_id
       cr::Worker::my().commitTX();
       success = true;
     } jumpmuCatch() {
-      send_error_response(ctx, request_id, 500, "Transaction aborted");
+      send_error_response(ctx, request_id, 500, "Transaction aborted payment_by_name");
       return;
     }
     
@@ -835,7 +1236,7 @@ void process_delivery_request(ConnectionContext* ctx, uint32_t request_id, const
       cr::Worker::my().commitTX();
       success = true;
     } jumpmuCatch() {
-      send_error_response(ctx, request_id, 500, "Transaction aborted");
+      send_error_response(ctx, request_id, 500, "Transaction aborted delivery");
       return;
     }
     
@@ -886,7 +1287,7 @@ void process_stock_level_request(ConnectionContext* ctx, uint32_t request_id, co
       cr::Worker::my().commitTX();
       success = true;
     } jumpmuCatch() {
-      send_error_response(ctx, request_id, 500, "Transaction aborted");
+      send_error_response(ctx, request_id, 500, "Transaction aborted stock_level");
       return;
     }
     
@@ -938,7 +1339,7 @@ void process_order_status_id_request(ConnectionContext* ctx, uint32_t request_id
       cr::Worker::my().commitTX();
       success = true;
     } jumpmuCatch() {
-      send_error_response(ctx, request_id, 500, "Transaction aborted");
+      send_error_response(ctx, request_id, 500, "Transaction aborted order_status_id");
       return;
     }
     
@@ -994,7 +1395,7 @@ void process_order_status_name_request(ConnectionContext* ctx, uint32_t request_
       cr::Worker::my().commitTX();
       success = true;
     } jumpmuCatch() {
-      send_error_response(ctx, request_id, 500, "Transaction aborted");
+      send_error_response(ctx, request_id, 500, "Transaction aborted order_status_name");
       return;
     }
     
@@ -1033,7 +1434,7 @@ void process_get_request(ConnectionContext* ctx, uint32_t request_id, const void
   BinaryPayload found_payload;
   
   jumpmuTry() {
-    cr::Worker::my().startTX(TX_MODE::OLTP, TX_ISOLATION_LEVEL::SNAPSHOT_ISOLATION, false);
+    cr::Worker::my().startTX(TX_MODE::OLTP, TX_ISOLATION_LEVEL::SNAPSHOT_ISOLATION, true);
     
     // Use lookup1 with a lambda to check if the key exists and extract the payload
     typename KVTable::Key k_key;
@@ -1065,7 +1466,6 @@ void process_get_request(ConnectionContext* ctx, uint32_t request_id, const void
     send_error_response(ctx, request_id, 404, "Key not found");
   }
 }
-
 // Process a PUT request
 void process_put_request(ConnectionContext* ctx, uint32_t request_id, const void* payload, size_t payload_size) {
   // A PUT request needs at least a key and some value data
@@ -1137,8 +1537,12 @@ void process_put_request(ConnectionContext* ctx, uint32_t request_id, const void
   
   // Prepare response
   if (success) {
-    // Create PUT_RESPONSE message (just a header with no payload)
-    Message response(PUT_RESPONSE, request_id, 0);
+    // Create PUT_RESPONSE message with proper payload size
+    Message response(PUT_RESPONSE, request_id, sizeof(PutResponse));
+    
+    // Set the success flag in the payload
+    PutResponse* resp = reinterpret_cast<PutResponse*>(response.payload.data());
+    resp->success = 1;  // 1 means success
     
     // Queue the response
     ctx->queue_response(std::move(response));
@@ -1380,102 +1784,8 @@ void process_single_request(ConnectionContext* ctx, Message&& request) {
   }
 }
 
-// TUX message handler
-int tux_message_handler(int fd, struct tux_user_context* user_ctx, 
-                        const struct tux_user_message* msg, 
-                        void* user_state) {
-  // Setup a connection context for this request
-  if (!g_connections.is_active(fd)) {
-    g_connections.add_connection(fd, 0);  // Worker ID doesn't matter for TUX
-  }
-  
-  ConnectionContext* ctx = g_connections.get_connection(fd);
-  if (!ctx) {
-    return -1;  // Failed to get connection context
-  }
-  
-  ctx->fd = fd;
-  ctx->received_via_tux = true;
-  
-  // Prepare buffer for the incoming message
-  size_t buffer_size = 0;
-  std::unique_ptr<char[]> buffer_ptr;
-  const char* buffer = nullptr;
-  
-  // If msg->n_packets == 1, point buffer to the first packet
-  // otherwise, allocate a buffer for the entire message
-  if (msg->n_packets == 1) {
-    buffer = static_cast<const char*>(msg->packets[0].iov_base);
-    buffer_size = msg->packets[0].iov_len;
-  } else {
-    for (uint32_t i = 0; i < msg->n_packets; ++i) {
-      buffer_size += msg->packets[i].iov_len;
-    }
-    
-    buffer_ptr = std::make_unique<char[]>(buffer_size);
-    buffer = buffer_ptr.get();
-    
-    if (!buffer) {
-      ctx->send_error_response(0, 500, "Memory allocation failed");
-      return -1;
-    }
-    
-    size_t offset = 0;
-    for (uint32_t i = 0; i < msg->n_packets; ++i) {
-      memcpy(buffer_ptr.get() + offset, 
-             msg->packets[i].iov_base, 
-             msg->packets[i].iov_len);
-      offset += msg->packets[i].iov_len;
-    }
-  }
-  
-  // Process the message similarly to handle_read
-  if (buffer_size < sizeof(MessageHeader)) {
-    ctx->send_error_response(0, 400, "Invalid message format");
-    return 0;
-  }
-  
-  const MessageHeader* header = reinterpret_cast<const MessageHeader*>(buffer);
-  
-  // Validate header
-  if (header->type < GET_REQUEST || header->type > ORDER_STATUS_NAME_REQUEST) {
-    ctx->send_error_response(header->request_id, 400, "Invalid request type");
-    return 0;
-  }
-  
-  // Check payload size
-  if (header->payload_size > 1024 * 1024) {  // 1MB max payload
-    ctx->send_error_response(header->request_id, 400, "Payload too large");
-    return 0;
-  }
-  
-  // Check if we have the full message
-  if (buffer_size < sizeof(MessageHeader) + header->payload_size) {
-    ctx->send_error_response(header->request_id, 400, "Incomplete message");
-    return 0;
-  }
-  
-  // Create message and add to request queue
-  Message request;
-  request.header = *header;
-  
-  if (header->payload_size > 0) {
-    request.payload.resize(header->payload_size);
-    memcpy(request.payload.data(), buffer + sizeof(MessageHeader), header->payload_size);
-  }
-  
-  ctx->request_queue.push(std::move(request));
-  
-  // Process all pending requests
-  process_all_requests(ctx);
-  
-  // Try to write responses immediately
-  handle_write(ctx);
-  
-  return 0;
-}
 
-cr::CRManager * g_crm = nullptr;
+
 // Worker thread function
 void worker_thread(uint32_t worker_id) {
   // Set thread name
@@ -1566,7 +1876,7 @@ void accept_connections(int listen_fd) {
     }
     
     // Try to register TUX handler for this connection
-    register_tux_handler(client_fd);
+    register_tux_udf(client_fd);
     
     // Add connection to pool
     if (!g_connections.add_connection(client_fd, next_worker)) {
@@ -1610,11 +1920,17 @@ int main(int argc, char* argv[]) {
   signal(SIGTERM, signal_handler);
   
   // Try to load TUX functions
-  // if (!initialize_tux_functions()) {
-  //   std::cout << "TUX functions not available, using standard sockets only." << std::endl;
-  // }
+  if (!initialize_tux_functions()) {
+    if (FLAGS_tux_mode != "none") {
+        std::cerr << "TUX functions required but not available. Exiting." << std::endl;
+        return 1;
+    }
+    std::cout << "TUX functions not available, using standard sockets only." << std::endl;
+  }
 
-  std::cout << "Starting TPC-C server with " << FLAGS_worker_threads << " worker threads." << std::endl;
+  std::cout << "Starting TPC-C server in TUX mode '" << FLAGS_tux_mode 
+          << "' with " << FLAGS_worker_threads << " worker threads." << std::endl;
+
 
   // Initialize LeanStore
   g_db = new LeanStore();
@@ -1622,12 +1938,9 @@ int main(int argc, char* argv[]) {
   auto& crm = g_db->getCRManager();
   g_crm = &crm;
 
-  // Create table
-  LeanStoreAdapter<KVTable>* table_ptr = new LeanStoreAdapter<KVTable>();
   
   crm.scheduleJobSync(0, [&]() {
     
-    *table_ptr = LeanStoreAdapter<KVTable>(*g_db, "KVStore"); 
     // Initialize TPCC tables
     g_warehouse = new warehouse_adapter_t(*g_db, "warehouse");
     g_district = new district_adapter_t(*g_db, "district");
@@ -1640,9 +1953,9 @@ int main(int argc, char* argv[]) {
     g_orderline = new orderline_adapter_t(*g_db, "orderline");
     g_item = new item_adapter_t(*g_db, "item");
     g_stock = new stock_adapter_t(*g_db, "stock");
-  });
 
-  g_table = table_ptr;
+    g_table = new LeanStoreAdapter<KVTable>(*g_db, "KVStore"); 
+  });
   
   // Initialize TPCC workload
   g_tpcc_workload = new TPCCWorkload<LeanStoreAdapter>(
@@ -1652,7 +1965,7 @@ int main(int argc, char* argv[]) {
       FLAGS_order_wdc_index,
       FLAGS_warehouse_count,
       FLAGS_tpcc_remove,
-      false,  // manually_handle_isolation_anomalies
+      true,  // manually_handle_isolation_anomalies
       FLAGS_warehouse_affinity
   );
 
@@ -1758,6 +2071,399 @@ int main(int argc, char* argv[]) {
   delete g_orderline;
   delete g_item;
   delete g_stock;
+  
+  return 0;
+}
+
+// TUX message handler
+int tux_message_handler(int fd, struct tux_user_context* user_ctx, 
+                        const struct tux_user_message* msg, 
+                        void* user_state) {
+  g_crm->registerMeAsSpecialWorker(FLAGS_worker_threads + 1);
+  
+  // Setup a connection context for this request
+  if (!g_connections.is_active(fd)) {
+    g_connections.add_connection(fd, 0);  // Worker ID doesn't matter for TUX
+  }
+  
+  ConnectionContext* conn_ctx = g_connections.get_connection(fd);
+  if (!conn_ctx) {
+    fprintf(stderr, "Failed to get connection context for fd %d\n", fd);
+    return 0;  // Failed to get connection context
+  }
+  
+  conn_ctx->fd = fd;
+  conn_ctx->received_via_tux = true;
+  
+  // Check if we have at least enough data for a header
+  if (msg->n_packets == 0) {
+    // Empty message, nothing to process
+    return 0;
+  }
+  
+  // Get the first packet which should contain at least the header
+  const char* first_packet = static_cast<const char*>(msg->packets[0].iov_base);
+  size_t first_packet_size = msg->packets[0].iov_len;
+  
+  if (first_packet_size < sizeof(MessageHeader)) {
+    // Not enough data for a header
+    Message error_msg(ERROR_RESPONSE, 0, sizeof(ErrorResponse) + 22);
+    ErrorResponse* err = reinterpret_cast<ErrorResponse*>(error_msg.payload.data());
+    err->error_code = 400;
+    memcpy(error_msg.payload.data() + sizeof(ErrorResponse), "Invalid message format", 22);
+    
+    // Send error response directly using tux
+    struct iovec iov[2];
+    iov[0].iov_base = &error_msg.header;
+    iov[0].iov_len = sizeof(MessageHeader);
+    iov[1].iov_base = error_msg.payload.data();
+    iov[1].iov_len = error_msg.payload.size();
+    
+    struct msghdr msgh;
+    memset(&msgh, 0, sizeof(msgh));
+    msgh.msg_iov = iov;
+    msgh.msg_iovlen = 2;
+    
+    g_libtux_send_tux_msg(fd, &msgh);
+    return 0;
+  }
+  
+  // Extract the header from the first packet
+  const MessageHeader* header = reinterpret_cast<const MessageHeader*>(first_packet);
+  
+  // Validate the message type
+  if (header->type < GET_REQUEST || header->type > ORDER_STATUS_NAME_REQUEST) {
+    Message error_msg(ERROR_RESPONSE, 0, sizeof(ErrorResponse) + 22);
+    ErrorResponse* err = reinterpret_cast<ErrorResponse*>(error_msg.payload.data());
+    err->error_code = 400;
+    memcpy(error_msg.payload.data() + sizeof(ErrorResponse), "Invalid request type", 21);
+    
+    // Send error response directly using tux
+    struct iovec iov[2];
+    iov[0].iov_base = &error_msg.header;
+    iov[0].iov_len = sizeof(MessageHeader);
+    iov[1].iov_base = error_msg.payload.data();
+    iov[1].iov_len = error_msg.payload.size();
+    
+    struct msghdr msgh;
+    memset(&msgh, 0, sizeof(msgh));
+    msgh.msg_iov = iov;
+    msgh.msg_iovlen = 2;
+    
+    g_libtux_send_tux_msg(fd, &msgh);
+    return 0;
+  }
+  
+  // Create the request message
+  Message request;
+  request.header = *header;
+  request.payload_ptr = nullptr;
+  // Calculate the expected total message size
+  size_t total_payload_size = header->payload_size;
+  
+  // Optimization: Check if the entire request fits in the first packet
+  if (first_packet_size >= sizeof(MessageHeader) + total_payload_size) {
+    // The entire message is in the first packet - no need to copy
+    // Just create a request with the payload pointing directly to the first packet
+    if (total_payload_size > 0) {
+      //request.payload.resize(total_payload_size);
+      //memcpy(request.payload.data(), first_packet + sizeof(MessageHeader), total_payload_size);
+      request.payload_ptr = (void*)first_packet + sizeof(MessageHeader);
+    }
+  } else {
+    // Need to gather data from multiple packets
+    request.payload.resize(total_payload_size);
+    
+    // Copy payload data from the first packet
+    size_t payload_copied = std::min(first_packet_size - sizeof(MessageHeader), total_payload_size);
+    if (payload_copied > 0) {
+      memcpy(request.payload.data(), first_packet + sizeof(MessageHeader), payload_copied);
+    }
+    
+    // Copy data from remaining packets if needed
+    size_t offset = payload_copied;
+    for (int i = 1; i < msg->n_packets && offset < total_payload_size; i++) {
+      const char* packet_data = static_cast<const char*>(msg->packets[i].iov_base);
+      size_t packet_size = msg->packets[i].iov_len;
+      size_t bytes_to_copy = std::min(packet_size, total_payload_size - offset);
+      
+      if (bytes_to_copy > 0) {
+        memcpy(request.payload.data() + offset, packet_data, bytes_to_copy);
+        offset += bytes_to_copy;
+      }
+    }
+    
+    // Check if we got all the payload data
+    if (offset < total_payload_size) {
+      Message error_msg(ERROR_RESPONSE, header->request_id, sizeof(ErrorResponse) + 19);
+      ErrorResponse* err = reinterpret_cast<ErrorResponse*>(error_msg.payload.data());
+      err->error_code = 400;
+      memcpy(error_msg.payload.data() + sizeof(ErrorResponse), "Incomplete message", 19);
+      
+      // Send error response directly using tux
+      struct iovec iov[2];
+      iov[0].iov_base = &error_msg.header;
+      iov[0].iov_len = sizeof(MessageHeader);
+      iov[1].iov_base = error_msg.payload.data();
+      iov[1].iov_len = error_msg.payload.size();
+      
+      struct msghdr msgh;
+      memset(&msgh, 0, sizeof(msgh));
+      msgh.msg_iov = iov;
+      msgh.msg_iovlen = 2;
+      
+      g_libtux_send_tux_msg(fd, &msgh);
+      return 0;
+    }
+  }
+  
+  // Extract payload pointer for convenience
+  const void* payload_ptr = request.payload.empty() ? request.payload_ptr : request.payload.data();
+  
+  // Process the request based on its type
+  switch (request.header.type) {
+    case GET_REQUEST:
+      {
+        // Extract key from payload
+        BinaryKey key = *reinterpret_cast<const BinaryKey*>(payload_ptr);
+        
+        // Try to get value from database
+        bool found = false;
+        BinaryPayload found_payload;
+        
+        jumpmuTry() {
+          // Use lookup1 with a lambda to check if the key exists and extract the payload
+          typename KVTable::Key k_key;
+          k_key.my_key = key;
+          
+          g_table->lookup1(k_key, [&](const KVTable& record) {
+            // Copy data from record to our value
+            found_payload = record.my_payload;
+            found = true;
+          });
+        } jumpmuCatch() {
+          found = false;
+        }
+        
+        // Send response
+        if (found) {
+          // Create GET_RESPONSE message
+          Message get_response(GET_RESPONSE, header->request_id, sizeof(found_payload));
+          
+          // Send response directly using tux
+          struct iovec iov[2];
+          iov[0].iov_base = &get_response.header;
+          iov[0].iov_len = sizeof(MessageHeader);
+          iov[1].iov_base = found_payload.value;
+          iov[1].iov_len = sizeof(found_payload);
+          
+          struct msghdr msgh;
+          memset(&msgh, 0, sizeof(msgh));
+          msgh.msg_iov = iov;
+          msgh.msg_iovlen = 2;
+          
+          g_libtux_send_tux_msg(fd, &msgh);
+        } else {
+          // Key not found
+          Message error_msg(ERROR_RESPONSE, header->request_id, sizeof(ErrorResponse) + 13);
+          ErrorResponse* err = reinterpret_cast<ErrorResponse*>(error_msg.payload.data());
+          err->error_code = 404;
+          memcpy(error_msg.payload.data() + sizeof(ErrorResponse), "Key not found", 13);
+          
+          // Send error response directly using tux
+          struct iovec iov[2];
+          iov[0].iov_base = &error_msg.header;
+          iov[0].iov_len = sizeof(MessageHeader);
+          iov[1].iov_base = error_msg.payload.data();
+          iov[1].iov_len = error_msg.payload.size();
+          
+          struct msghdr msgh;
+          memset(&msgh, 0, sizeof(msgh));
+          msgh.msg_iov = iov;
+          msgh.msg_iovlen = 2;
+          
+          g_libtux_send_tux_msg(fd, &msgh);
+        }
+      }
+      break;
+      
+    case PUT_REQUEST:
+      {
+        // Extract key from the beginning of payload
+        BinaryKey key = *reinterpret_cast<const BinaryKey*>(payload_ptr);
+        
+        // Value follows the key in the payload
+        size_t value_size = total_payload_size - sizeof(BinaryKey);
+        const void* value_data = reinterpret_cast<const char*>(payload_ptr) + sizeof(BinaryKey);
+        
+        // Check if the value size is valid
+        if (value_size > sizeof(BinaryPayload::value)) {
+          // Value too large
+          std::string error_msg_str = "Value too large, max size: " + std::to_string(sizeof(BinaryPayload::value));
+          Message error_msg(ERROR_RESPONSE, header->request_id, sizeof(ErrorResponse) + error_msg_str.size());
+          ErrorResponse* err = reinterpret_cast<ErrorResponse*>(error_msg.payload.data());
+          err->error_code = 413;
+          memcpy(error_msg.payload.data() + sizeof(ErrorResponse), error_msg_str.c_str(), error_msg_str.size());
+          
+          // Send error response directly using tux
+          struct iovec iov[2];
+          iov[0].iov_base = &error_msg.header;
+          iov[0].iov_len = sizeof(MessageHeader);
+          iov[1].iov_base = error_msg.payload.data();
+          iov[1].iov_len = error_msg.payload.size();
+          
+          struct msghdr msgh;
+          memset(&msgh, 0, sizeof(msgh));
+          msgh.msg_iov = iov;
+          msgh.msg_iovlen = 2;
+          
+          g_libtux_send_tux_msg(fd, &msgh);
+          break;
+        }
+        
+        bool success = false;
+        
+        // START TRANSACTION
+        jumpmuTry() {
+          cr::Worker::my().startTX(TX_MODE::OLTP, TX_ISOLATION_LEVEL::SNAPSHOT_ISOLATION, false);
+          
+          // Check if key exists
+          bool exists = false;
+          typename KVTable::Key k_key;
+          k_key.my_key = key;
+          
+          g_table->lookup1(k_key, [&](const KVTable& record) {
+            exists = true;
+          });
+          
+          if (exists) {
+            UpdateDescriptorGenerator1(tabular_update_descriptor, KVTable, my_payload);
+            // Key exists, use update
+            g_table->update1(k_key, [&](KVTable& record) {
+              // Copy the value data into the record
+              memcpy(record.my_payload.value, value_data, value_size);
+            }, tabular_update_descriptor);
+          } else {
+            // Key doesn't exist, insert new record
+            KVTable record;
+            // Copy the value data
+            memcpy(record.my_payload.value, value_data, value_size);
+            
+            g_table->insert(k_key, record);
+          }
+          
+          cr::Worker::my().commitTX();
+          success = true;
+        } jumpmuCatch() {
+          success = false;
+        }
+        
+        // Send response
+        if (success) {
+          // Create PUT_RESPONSE message with proper payload size
+          Message put_response(PUT_RESPONSE, header->request_id, 0);
+          
+          // Set the success flag in the payload
+          PutResponse resp;
+          resp.success = 1;  // 1 means success
+          
+          // Send response directly using tux
+          struct iovec iov[2];
+          iov[0].iov_base = &put_response.header;
+          iov[0].iov_len = sizeof(MessageHeader);
+          iov[1].iov_base = &resp;
+          iov[1].iov_len = sizeof(PutResponse);
+          
+          struct msghdr msgh;
+          memset(&msgh, 0, sizeof(msgh));
+          msgh.msg_iov = iov;
+          msgh.msg_iovlen = 2;
+          
+          g_libtux_send_tux_msg(fd, &msgh);
+        } else {
+          // Failed to store value
+          Message error_msg(ERROR_RESPONSE, header->request_id, sizeof(ErrorResponse) + 19);
+          ErrorResponse* err = reinterpret_cast<ErrorResponse*>(error_msg.payload.data());
+          err->error_code = 500;
+          memcpy(error_msg.payload.data() + sizeof(ErrorResponse), "Failed to store value", 19);
+          
+          // Send error response directly using tux
+          struct iovec iov[2];
+          iov[0].iov_base = &error_msg.header;
+          iov[0].iov_len = sizeof(MessageHeader);
+          iov[1].iov_base = error_msg.payload.data();
+          iov[1].iov_len = error_msg.payload.size();
+          
+          struct msghdr msgh;
+          memset(&msgh, 0, sizeof(msgh));
+          msgh.msg_iov = iov;
+          msgh.msg_iovlen = 2;
+          
+          g_libtux_send_tux_msg(fd, &msgh);
+        }
+      }
+      break;
+      
+    case NEW_ORDER_REQUEST:
+    case PAYMENT_BY_ID_REQUEST:
+    case PAYMENT_BY_NAME_REQUEST:
+    case ORDER_STATUS_ID_REQUEST:
+    case ORDER_STATUS_NAME_REQUEST:
+    case DELIVERY_REQUEST:
+    case STOCK_LEVEL_REQUEST:
+      {
+        // Queue request for processing
+        conn_ctx->request_queue.push(std::move(request));
+        
+        // Process all requests in the queue
+        process_all_requests(conn_ctx);
+        
+        // Send all queued responses using tux
+        conn_ctx->prepare_write_data();
+        if (!conn_ctx->write_buffer.empty()) {
+          // Create a single iovec for the entire write buffer
+          struct iovec iov;
+          iov.iov_base = conn_ctx->write_buffer.data();
+          iov.iov_len = conn_ctx->write_buffer.size();
+          
+          struct msghdr msgh;
+          memset(&msgh, 0, sizeof(msgh));
+          msgh.msg_iov = &iov;
+          msgh.msg_iovlen = 1;
+          
+          g_libtux_send_tux_msg(fd, &msgh);
+          
+          // Clear the write buffer since we've sent everything
+          conn_ctx->write_buffer.clear();
+          conn_ctx->bytes_written = 0;
+        }
+      }
+      break;
+      
+    default:
+      {
+        // Unsupported request type
+        Message error_msg(ERROR_RESPONSE, header->request_id, sizeof(ErrorResponse) + 28);
+        ErrorResponse* err = reinterpret_cast<ErrorResponse*>(error_msg.payload.data());
+        err->error_code = 400;
+        memcpy(error_msg.payload.data() + sizeof(ErrorResponse), "Unsupported request in message", 29);
+        
+        // Send error response directly using tux
+        struct iovec iov[2];
+        iov[0].iov_base = &error_msg.header;
+        iov[0].iov_len = sizeof(MessageHeader);
+        iov[1].iov_base = error_msg.payload.data();
+        iov[1].iov_len = error_msg.payload.size();
+        
+        struct msghdr msgh;
+        memset(&msgh, 0, sizeof(msgh));
+        msgh.msg_iov = iov;
+        msgh.msg_iovlen = 2;
+        
+        g_libtux_send_tux_msg(fd, &msgh);
+      }
+      break;
+  }
   
   return 0;
 }
