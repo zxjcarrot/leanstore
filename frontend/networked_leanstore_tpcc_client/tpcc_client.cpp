@@ -47,6 +47,10 @@ DEFINE_bool(kv_mode, false, "Run in key-value mode instead of TPC-C mode");
 DEFINE_uint32(kv_get_percent, 100, "Percentage of GET operations in key-value mode (0-100)");
 DEFINE_uint32(key_range, 1000000, "Range of keys to use for key-value operations");
 DEFINE_uint32(value_size, 1000, "Size of values for PUT operations in bytes");
+// Add these flags with other DEFINE flags at the top of the file
+DEFINE_bool(kv_get_put_scan_mode, false, "Run in key-value scan mode (get/put/scan operations)");
+DEFINE_string(kv_get_put_scan_mixture, "100/0/0", "Mixture of GET/PUT/SCAN operations in format: GET%/PUT%/SCAN%");
+DEFINE_uint32(scan_length, 100, "Number of keys to scan in each SCAN operation");
 
 DEFINE_bool(load_data, false, "Run in data loading mode before benchmark");
 DEFINE_uint64(load_keys, 1000000, "Number of keys to load in data loading mode");
@@ -103,7 +107,10 @@ enum MessageType {
     ORDER_STATUS_ID_REQUEST = 20,
     ORDER_STATUS_ID_RESPONSE = 21,
     ORDER_STATUS_NAME_REQUEST = 22,
-    ORDER_STATUS_NAME_RESPONSE = 23
+    ORDER_STATUS_NAME_RESPONSE = 23,
+    // Add scan types
+    SCAN_REQUEST = 24,
+    SCAN_RESPONSE = 25
 };
 
 // Message header matching server format
@@ -134,7 +141,18 @@ struct PutResponse {
 uint8_t success;
 } __attribute__((packed));
 
-  
+// Add after the existing request/response structures
+// SCAN request and response structures
+struct ScanRequest {
+    BinaryKey start_key;
+    uint32_t scan_length;
+} __attribute__((packed));
+
+struct ScanResponse {
+    uint64_t sum;         // Sum of first byte of each value
+    uint32_t scanned_count;  // Number of records actually scanned
+} __attribute__((packed));
+
 // TPC-C Request/Response Structures
 struct NewOrderRequest {
     Integer w_id;
@@ -233,7 +251,8 @@ enum TPCCTxType {
 // Add KV transaction types in the enum section
 enum KVTxType {
     KV_GET = 5,
-    KV_PUT = 6
+    KV_PUT = 6,
+    KV_SCAN = 7  // Add this new type
 };
 
 // Modify PendingTransaction to include connection pointer
@@ -680,10 +699,28 @@ private:
     std::uniform_int_distribution<BinaryKey> key_dist;
     std::vector<char> random_value_data;
     
+    // Add new members for operation mixture
+    int get_percent;
+    int put_percent;
+    int scan_percent;
+    
 public:
     KVWorkloadGenerator() : 
         gen(std::random_device{}()),
         key_dist(1, FLAGS_key_range) {
+        
+        // Parse the mixture string if in scan mode
+        get_percent = 100;  // Default: 100% GET
+        put_percent = 0;
+        scan_percent = 0;
+        
+        if (FLAGS_kv_get_put_scan_mode) {
+            parseOperationMixture(FLAGS_kv_get_put_scan_mixture);
+        } else if (FLAGS_kv_mode) {
+            get_percent = FLAGS_kv_get_percent;
+            put_percent = 100 - get_percent;
+            scan_percent = 0;
+        }
         
         // Pre-generate random value data for PUTs
         random_value_data.resize(FLAGS_value_size);
@@ -693,6 +730,60 @@ public:
         }
     }
     
+    // Parse the operation mixture string (format: "GET%/PUT%/SCAN%")
+    void parseOperationMixture(const std::string& mixture) {
+        std::stringstream ss(mixture);
+        std::string get_str, put_str, scan_str;
+        
+        if (std::getline(ss, get_str, '/') && 
+            std::getline(ss, put_str, '/') && 
+            std::getline(ss, scan_str)) {
+            
+            try {
+                get_percent = std::stoi(get_str);
+                put_percent = std::stoi(put_str);
+                scan_percent = std::stoi(scan_str);
+                
+                // Validate the percentages
+                if (get_percent < 0 || put_percent < 0 || scan_percent < 0 ||
+                    get_percent + put_percent + scan_percent != 100) {
+                    std::cerr << "Invalid operation mixture: " << mixture << std::endl;
+                    std::cerr << "Using default mixture: 100/0/0" << std::endl;
+                    get_percent = 100;
+                    put_percent = 0;
+                    scan_percent = 0;
+                }
+            } catch (const std::exception& e) {
+                std::cerr << "Error parsing operation mixture: " << e.what() << std::endl;
+                std::cerr << "Using default mixture: 100/0/0" << std::endl;
+                get_percent = 100;
+                put_percent = 0;
+                scan_percent = 0;
+            }
+        } else {
+            std::cerr << "Invalid operation mixture format: " << mixture << std::endl;
+            std::cerr << "Format should be 'GET%/PUT%/SCAN%'" << std::endl;
+            std::cerr << "Using default mixture: 100/0/0" << std::endl;
+            get_percent = 100;
+            put_percent = 0;
+            scan_percent = 0;
+        }
+    }
+    
+    // Determine which operation to perform based on the mixture
+    KVTxType getNextOperation() {
+        int rnd = std::uniform_int_distribution<>(1, 100)(gen);
+        
+        if (rnd <= get_percent) {
+            return KV_GET;
+        } else if (rnd <= get_percent + put_percent) {
+            return KV_PUT;
+        } else {
+            return KV_SCAN;
+        }
+    }
+    
+    // Legacy method for backwards compatibility with existing code
     bool isGetOperation() {
         return std::uniform_int_distribution<>(1, 100)(gen) <= FLAGS_kv_get_percent;
     }
@@ -1183,7 +1274,14 @@ public:
                     success = response->success != 0;
                 }
                 break;
-                
+            // Add new case to the process_response method in TPCCConnection class
+            case SCAN_RESPONSE:
+            if (it->second.tx_type == static_cast<TPCCTxType>(KV_SCAN)) {
+                const ScanResponse* response = reinterpret_cast<const ScanResponse*>(payload);
+                // For SCAN operations, we consider any response successful
+                success = true;
+            }
+            break;
             case ERROR_RESPONSE:
                 success = false;
                 break;
@@ -1246,6 +1344,22 @@ public:
         return false;
     }
 
+    // Add this method to the TPCCConnection class
+    bool send_scan(uint32_t request_id, BinaryKey start_key, uint32_t scan_length) {
+        ScanRequest req;
+        req.start_key = start_key;
+        req.scan_length = scan_length;
+        
+        // Calculate total message size for tracking
+        size_t total_request_size = sizeof(MessageHeader) + sizeof(ScanRequest);
+        
+        if (send_request(SCAN_REQUEST, request_id, req)) {
+            pending_transactions.emplace(request_id, 
+                PendingTransaction(request_id, static_cast<TPCCTxType>(KV_SCAN), total_request_size, this));
+            return true;
+        }
+        return false;
+    }
     // Send a Get request
     bool send_get(uint32_t request_id, BinaryKey key) {
         GetRequest req;
@@ -1393,8 +1507,32 @@ public:
                         uint32_t request_id = next_request_id++;
                         bool success = false;
                         
-                        if (FLAGS_kv_mode) {
-                            // Key-value workload
+                        // Modify the part of the run() method in TPCCWorkerThread class that sends transactions
+                        if (FLAGS_kv_get_put_scan_mode) {
+                            // Key-value scan workload
+                            KVTxType op_type = kv_generator.getNextOperation();
+                            BinaryKey key = kv_generator.getRandomKey();
+                            
+                            switch (op_type) {
+                                case KV_GET:
+                                    // Send a GET request
+                                    success = conn->send_get(request_id, key);
+                                    break;
+                                    
+                                case KV_PUT:
+                                    // Send a PUT request
+                                    success = conn->send_put(request_id, key, 
+                                                        kv_generator.getRandomValue(),
+                                                        kv_generator.getValueSize());
+                                    break;
+                                    
+                                case KV_SCAN:
+                                    // Send a SCAN request
+                                    success = conn->send_scan(request_id, key, FLAGS_scan_length);
+                                    break;
+                            }
+                        } else if (FLAGS_kv_mode) {
+                            // Original key-value workload (backwards compatibility)
                             BinaryKey key = kv_generator.getRandomKey();
                             
                             if (kv_generator.isGetOperation()) {
@@ -1403,8 +1541,8 @@ public:
                             } else {
                                 // Send a PUT request
                                 success = conn->send_put(request_id, key, 
-                                                      kv_generator.getRandomValue(),
-                                                      kv_generator.getValueSize());
+                                                    kv_generator.getRandomValue(),
+                                                    kv_generator.getValueSize());
                             }
                         } else {
                             // Original TPC-C workload
@@ -1613,32 +1751,40 @@ int main(int argc, char** argv) {
         }
     }
     
-    // Print configuration
+    // In the main function, update the configuration output
     std::cout << "=== Benchmark Configuration ===" << std::endl;
     std::cout << "Server: " << FLAGS_server << ":" << FLAGS_port << std::endl;
     std::cout << "Threads: " << FLAGS_threads << std::endl;
     std::cout << "Connections per thread: " << FLAGS_connections_per_thread << std::endl;
-    std::cout << "Mode: " << (FLAGS_kv_mode ? "Key-Value" : "TPC-C") << std::endl;
 
-    if (FLAGS_kv_mode) {
-        std::cout << "KV Workload: " << FLAGS_kv_get_percent << "% GETs, " 
-                  << (100 - FLAGS_kv_get_percent) << "% PUTs" << std::endl;
+    if (FLAGS_kv_get_put_scan_mode) {
+        std::cout << "Mode: Key-Value with Scan" << std::endl;
+        std::cout << "KV Workload: " << FLAGS_kv_get_put_scan_mixture << " (GET%/PUT%/SCAN%)" << std::endl;
+        std::cout << "Scan length: " << FLAGS_scan_length << " keys" << std::endl;
         std::cout << "Key range: " << FLAGS_key_range << std::endl;
         std::cout << "Value size: " << FLAGS_value_size << " bytes" << std::endl;
-            // Run data loading phase if requested
-        if (FLAGS_load_data) {
-            load_data_phase();
-            
-            // If we're only loading data, exit after loading
-            if (FLAGS_runtime == 0) {
-                return 0;
-            }
-            
-            std::cout << "Loading complete, starting benchmark..." << std::endl;
-        }
+    } else if (FLAGS_kv_mode) {
+        std::cout << "Mode: Key-Value" << std::endl;
+        std::cout << "KV Workload: " << FLAGS_kv_get_percent << "% GETs, " 
+                << (100 - FLAGS_kv_get_percent) << "% PUTs" << std::endl;
+        std::cout << "Key range: " << FLAGS_key_range << std::endl;
+        std::cout << "Value size: " << FLAGS_value_size << " bytes" << std::endl;
     } else {
+        std::cout << "Mode: TPC-C" << std::endl;
         std::cout << "Warehouses: " << FLAGS_warehouses << std::endl;
         std::cout << "Warehouse affinity: " << (FLAGS_warehouse_affinity ? "enabled" : "disabled") << std::endl;
+    }
+
+    // Run data loading phase if requested - shared for both KV modes
+    if ((FLAGS_kv_mode || FLAGS_kv_get_put_scan_mode) && FLAGS_load_data) {
+        load_data_phase();
+        
+        // If we're only loading data, exit after loading
+        if (FLAGS_runtime == 0) {
+            return 0;
+        }
+        
+        std::cout << "Loading complete, starting benchmark..." << std::endl;
     }
     
     std::cout << "Runtime: " << FLAGS_runtime << " seconds" << std::endl;
