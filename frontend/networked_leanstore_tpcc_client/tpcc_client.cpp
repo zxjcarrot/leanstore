@@ -236,17 +236,18 @@ enum KVTxType {
     KV_PUT = 6
 };
 
-// Structure to track a pending transaction
+// Modify PendingTransaction to include connection pointer
 struct PendingTransaction {
     uint32_t request_id;
     TPCCTxType tx_type;
     std::chrono::high_resolution_clock::time_point start_time;
     size_t request_size;  // Store request size for later reporting
+    void* connection_ptr; // Store pointer to the connection that sent this transaction
     
-    PendingTransaction(uint32_t id, TPCCTxType type, size_t req_size = 0)
+    PendingTransaction(uint32_t id, TPCCTxType type, size_t req_size = 0, void* conn_ptr = nullptr)
         : request_id(id), tx_type(type), 
           start_time(std::chrono::high_resolution_clock::now()),
-          request_size(req_size) {}
+          request_size(req_size), connection_ptr(conn_ptr) {}
 };
 
 std::string get_current_time_micro() {
@@ -284,7 +285,15 @@ private:
     std::atomic<uint64_t> total_response_bytes{0};
     std::atomic<uint64_t> request_bytes_by_type[7]{0}; // Size by transaction type
     std::atomic<uint64_t> response_bytes_by_type[7]{0}; // Size by transaction type
-
+// Add this to the TPCCStatistics class in the private section
+private:
+    // Add a separate structure for aggregated latency stats
+    struct AggregateLatencyStats {
+        std::mutex mutex;
+        std::vector<double> latencies;
+    };
+    
+    AggregateLatencyStats aggregate_latencies; // For storing all latencies combined
 public:
     TPCCStatistics() {
         reset();
@@ -317,7 +326,6 @@ public:
         last_report_time = start_time;
         last_report_total = 0;
     }
-    
     void record_transaction(TPCCTxType tx_type, bool success, 
                            const std::chrono::high_resolution_clock::time_point& start_time) {
         total_tx.fetch_add(1, std::memory_order_relaxed);
@@ -334,8 +342,17 @@ public:
             auto now = std::chrono::high_resolution_clock::now();
             double latency_ms = std::chrono::duration<double, std::milli>(now - start_time).count();
             
-            std::lock_guard<std::mutex> lock(tx_latencies[tx_type].mutex);
-            tx_latencies[tx_type].latencies.push_back(latency_ms);
+            // Record type-specific latency
+            {
+                std::lock_guard<std::mutex> lock(tx_latencies[tx_type].mutex);
+                tx_latencies[tx_type].latencies.push_back(latency_ms);
+            }
+            
+            // Also record in the aggregate latency stats
+            {
+                std::lock_guard<std::mutex> lock(aggregate_latencies.mutex);
+                aggregate_latencies.latencies.push_back(latency_ms);
+            }
         }
     }
     
@@ -358,11 +375,14 @@ public:
         double throughput = (elapsed_total > 0) ? (total / elapsed_total) : 0;
         double interval_throughput = (elapsed_since_last > 0) ? 
                                   ((total - last_report_total) / elapsed_since_last) : 0;
-        
+        // if (final == false && elapsed_total > 10 && interval_throughput < 0.0001) {
+        //     printf("Interval throughput is zero!!!!\n");
+        //     exit(1);
+        // }
         if (final) {
             // Keep the detailed final statistics output
             std::cout << "\n========== FINAL TPCC STATISTICS ==========\n";
-            std::cout << std::fixed << std::setprecision(2);
+            std::cout << std::fixed << std::setprecision(3);
             std::cout << "Runtime: " << elapsed_total << "s\n";
             std::cout << "Throughput: " << throughput << " txn/sec\n";
             std::cout << "Total transactions: " << total << "\n";
@@ -394,7 +414,7 @@ public:
             double bandwidth_mbps = (elapsed_total > 0) ? (total_mb / elapsed_total) : 0;
             
             std::cout << "\nNetwork Statistics:\n";
-            std::cout << "  Total sent: " << std::fixed << std::setprecision(2) << req_mb << " MB\n";
+            std::cout << "  Total sent: " << std::fixed << std::setprecision(3) << req_mb << " MB\n";
             std::cout << "  Total received: " << resp_mb << " MB\n";
             std::cout << "  Total traffic: " << total_mb << " MB\n";
             std::cout << "  Average bandwidth: " << bandwidth_mbps << " MB/sec\n";
@@ -420,7 +440,7 @@ public:
             }
         } else {
             // Simplified progress report
-            std::cout << "=== [" << elapsed_total << "s] Progress: " 
+            std::cout << "=== [" << elapsed_total << "s] " << ", Success Rate: " << (success / ((float)total + 0.001)) <<" Progress: " 
                       << throughput << " txn/sec (last " << elapsed_since_last << "s: " 
                       << interval_throughput << " txn/sec) ===\n";
             
@@ -447,11 +467,37 @@ private:
         
         return sorted_data[lower_idx] * (1 - weight) + sorted_data[upper_idx] * weight;
     }
-    
     void print_latency_stats() {
         const char* tx_names[] = {"Payment", "Order-Status", "Delivery", "Stock-Level", "New-Order", "KV-GET", "KV-PUT"};
         std::cout << "\n==== LATENCY STATISTICS ====\n";
         
+        // First print aggregate statistics for all transaction types combined
+        {
+            std::vector<double> all_latencies;
+            {
+                std::lock_guard<std::mutex> lock(aggregate_latencies.mutex);
+                all_latencies = aggregate_latencies.latencies; // make a copy
+            }
+            
+            if (!all_latencies.empty()) {
+                std::sort(all_latencies.begin(), all_latencies.end());
+                
+                double min = all_latencies.front();
+                double max = all_latencies.back();
+                double sum = std::accumulate(all_latencies.begin(), all_latencies.end(), 0.0);
+                double avg = sum / all_latencies.size();
+                double p50 = calculate_percentile(all_latencies, 0.5);
+                double p95 = calculate_percentile(all_latencies, 0.95);
+                double p99 = calculate_percentile(all_latencies, 0.99);
+                double p999 = calculate_percentile(all_latencies, 0.999);
+                
+                std::cout << "AGGREGATE Latency (ms, " << all_latencies.size() << " samples):\n";
+                std::cout << "  Min: " << min << ", Avg: " << avg << ", Max: " << max << "\n";
+                std::cout << "  p50: " << p50 << ", p95: " << p95 << ", p99: " << p99 << ", p99.9: " << p999  << std::fixed << std::setprecision(3) << "\n\n";
+            }
+        }
+        
+        // Then print individual transaction type statistics as before
         for (int i = 0; i < 7; i++) {
             std::vector<double> latencies;
             {
@@ -477,21 +523,44 @@ private:
             std::cout << "  p50: " << p50 << ", p95: " << p95 << ", p99: " << p99 << ", p99.9: " << p999 << "\n\n";
         }
     }
-
-    // Add a new method for simplified latency reporting during progress reports
     void print_realtime_latency_summary() {
         std::cout << "Latencies (ms) - ";
+        
+        // First print aggregate statistics
+        {
+            std::vector<double> all_latencies;
+            {
+                std::lock_guard<std::mutex> lock(aggregate_latencies.mutex);
+                // Only copy last 1000 samples for efficiency
+                size_t start_idx = aggregate_latencies.latencies.size() > 1000 ? 
+                                aggregate_latencies.latencies.size() - 1000 : 0;
+                if (start_idx < aggregate_latencies.latencies.size()) {
+                    all_latencies.assign(
+                        aggregate_latencies.latencies.begin() + start_idx,
+                        aggregate_latencies.latencies.end()
+                    );
+                }
+            }
+            
+            if (!all_latencies.empty()) {
+                std::sort(all_latencies.begin(), all_latencies.end());
+                double p99 = calculate_percentile(all_latencies, 0.99);
+                
+                std::cout << "ALL p99: " << std::fixed << std::setprecision(3) << p99;
+            }
+        }
         
         const char* tx_names[] = {"Payment", "Order-Status", "Delivery", "Stock-Level", "New-Order", "KV-GET", "KV-PUT"};
         bool first = true;
         
+        // Then print individual transaction types
         for (int i = 0; i < 7; i++) {
             std::vector<double> latencies;
             {
                 std::lock_guard<std::mutex> lock(tx_latencies[i].mutex);
                 // Only copy last 1000 samples for efficiency
                 size_t start_idx = tx_latencies[i].latencies.size() > 1000 ? 
-                                   tx_latencies[i].latencies.size() - 1000 : 0;
+                                tx_latencies[i].latencies.size() - 1000 : 0;
                 if (start_idx < tx_latencies[i].latencies.size()) {
                     latencies.assign(
                         tx_latencies[i].latencies.begin() + start_idx,
@@ -505,10 +574,7 @@ private:
             std::sort(latencies.begin(), latencies.end());
             double p99 = calculate_percentile(latencies, 0.99);
             
-            if (!first) std::cout << ", ";
-            first = false;
-            
-            std::cout << tx_names[i] << " p99: " << std::fixed << std::setprecision(2) << p99;
+            std::cout << ", " << tx_names[i] << " p99: " << std::fixed << std::setprecision(3) << p99;
         }
         
         std::cout << std::endl;
@@ -727,7 +793,8 @@ public:
         return send_request_with_data(msg_type, request_id, &payload, sizeof(T), target_worker);
     }
     
-    // Send request with arbitrary data (for variable length payloads)
+    // Replace the current send_request_with_data with this implementation
+
     bool send_request_with_data(uint8_t msg_type, uint32_t request_id, const void* payload, size_t payload_size, uint8_t target_worker = 255) {
         if (!connected) {
             printf("Not connected to server\n");
@@ -744,8 +811,6 @@ public:
         
         // Calculate total size for tracking
         size_t total_size = sizeof(header) + payload_size;
-        
-        ssize_t bytes_sent;
         
         if (use_tux) {
             // TUX sending code using iovec array and msghdr
@@ -768,7 +833,8 @@ public:
             msg.msg_iovlen = (payload_size > 0 && payload != nullptr) ? 2 : 1;
             
             // Send the message using TUX
-            bytes_sent = g_libtux_send_tux_msg(fd, &msg);
+            ssize_t bytes_sent = g_libtux_send_tux_msg(fd, &msg);
+            return (bytes_sent == total_size);
         } else {
             // Standard send implementation - prepare buffer first
             
@@ -783,18 +849,32 @@ public:
                 memcpy(send_buffer.data() + sizeof(header), payload, payload_size);
             }
             
-            // Send the request using standard socket send
-            bytes_sent = send(fd, send_buffer.data(), total_size, 0);
+            // Send the request using standard socket send with retry for partial sends
+            size_t bytes_sent_total = 0;
+            while (bytes_sent_total < total_size) {
+                ssize_t bytes_sent = send(fd, send_buffer.data() + bytes_sent_total, 
+                                        total_size - bytes_sent_total, 0);
+                
+                if (bytes_sent < 0) {
+                    if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                        // Socket buffer is full, try again after a small delay
+                        std::this_thread::sleep_for(std::chrono::microseconds(10));
+                        continue;
+                    }
+                    // Any other error is a failure
+                    return false;
+                } else if (bytes_sent == 0) {
+                    // Connection closed
+                    connected = false;
+                    return false;
+                }
+                
+                bytes_sent_total += bytes_sent;
+            }
+            
+            // Return true if we sent the entire message
+            return (bytes_sent_total == total_size);
         }
-        
-        if (bytes_sent != total_size) {
-            // Handle partial send case
-            printf("Partial send: %zd bytes sent, expected %zu bytes\n", bytes_sent, total_size);
-        }
-        // print request id , timestamp and size
-        //printf("Sent request %u at %s\n", request_id, get_current_time_micro().c_str(), total_size);
-        // Return true only if we sent the entire message
-        return (bytes_sent == total_size);
     }
     
     // Send a payment transaction
@@ -814,7 +894,7 @@ public:
             req.h_amount = random_gen.urand(100, 5000) / 100.0; // Random amount between 1.00 and 50.00
             
             if (send_request(PAYMENT_BY_ID_REQUEST, request_id, req)) {
-                pending_transactions.emplace(request_id, PendingTransaction(request_id, PAYMENT, sizeof(req)));
+                pending_transactions.emplace(request_id, PendingTransaction(request_id, PAYMENT, sizeof(req), this));
                 return true;
             }
             return false;
@@ -835,7 +915,7 @@ public:
             req.c_id = random_gen.generateCustomerId();
             
             if (send_request(ORDER_STATUS_ID_REQUEST, request_id, req)) {
-                pending_transactions.emplace(request_id, PendingTransaction(request_id, ORDER_STATUS, sizeof(req)));
+                pending_transactions.emplace(request_id, PendingTransaction(request_id, ORDER_STATUS, sizeof(req), this));
                 return true;
             }
             return false;
@@ -849,7 +929,7 @@ public:
         req.carrier_id = random_gen.urand(1, 10);
         
         if (send_request(DELIVERY_REQUEST, request_id, req)) {
-            pending_transactions.emplace(request_id, PendingTransaction(request_id, DELIVERY, sizeof(req)));
+            pending_transactions.emplace(request_id, PendingTransaction(request_id, DELIVERY, sizeof(req), this));
             return true;
         }
         return false;
@@ -863,7 +943,7 @@ public:
         req.threshold = random_gen.urand(10, 20);
         
         if (send_request(STOCK_LEVEL_REQUEST, request_id, req)) {
-            pending_transactions.emplace(request_id, PendingTransaction(request_id, STOCK_LEVEL, sizeof(req)));
+            pending_transactions.emplace(request_id, PendingTransaction(request_id, STOCK_LEVEL, sizeof(req), this));
             return true;
         }
         return false;
@@ -914,7 +994,7 @@ public:
         
         // Send the request using our existing helper
         if (send_request_with_data(NEW_ORDER_REQUEST, request_id, payload.data(), payload_size)) {
-            pending_transactions.emplace(request_id, PendingTransaction(request_id, NEW_ORDER, payload_size));
+            pending_transactions.emplace(request_id, PendingTransaction(request_id, NEW_ORDER, payload_size, this));
             return true;
         }
         return false;
@@ -1142,7 +1222,7 @@ public:
         req.h_amount = random_gen.urand(100, 5000) / 100.0; // Random amount between 1.00 and 50.00
         
         if (send_request(PAYMENT_BY_NAME_REQUEST, request_id, req)) {
-            pending_transactions.emplace(request_id, PendingTransaction(request_id, PAYMENT, sizeof(req)));
+            pending_transactions.emplace(request_id, PendingTransaction(request_id, PAYMENT, sizeof(req), this));
             return true;
         }
         return false;
@@ -1160,7 +1240,7 @@ public:
         req.c_last[sizeof(req.c_last) - 1] = '\0'; // Ensure null-termination
         
         if (send_request(ORDER_STATUS_NAME_REQUEST, request_id, req)) {
-            pending_transactions.emplace(request_id, PendingTransaction(request_id, ORDER_STATUS, sizeof(req)));
+            pending_transactions.emplace(request_id, PendingTransaction(request_id, ORDER_STATUS, sizeof(req), this));
             return true;
         }
         return false;
@@ -1176,7 +1256,7 @@ public:
         
         if (send_request(GET_REQUEST, request_id, req)) {
             pending_transactions.emplace(request_id, 
-                PendingTransaction(request_id, static_cast<TPCCTxType>(KV_GET), total_request_size));
+                PendingTransaction(request_id, static_cast<TPCCTxType>(KV_GET), total_request_size, this));
             return true;
         }
         return false;
@@ -1200,9 +1280,9 @@ public:
         }
         
         // Send the request with the complete payload
-        if (send_request_with_data(PUT_REQUEST, request_id, payload.data(), payload_size,target_worker)) {
-            //printf("Sent PUT request with key %u and value size %zu\n", key, value_size);
-            pending_transactions.emplace(request_id, PendingTransaction(request_id, static_cast<TPCCTxType>(KV_PUT), payload_size));
+        if (send_request_with_data(PUT_REQUEST, request_id, payload.data(), payload_size, target_worker)) {
+            pending_transactions.emplace(request_id, 
+                PendingTransaction(request_id, static_cast<TPCCTxType>(KV_PUT), payload_size, this));
             return true;
         }
         return false;
@@ -1227,6 +1307,9 @@ private:
     // Rate limiting members
     std::chrono::high_resolution_clock::time_point last_tx_time;
     std::chrono::nanoseconds tx_interval;
+
+    // Add a method to track per-connection inflight transactions
+    std::unordered_map<TPCCConnection*, size_t> connection_inflight_counts;
 
 public:
     TPCCWorkerThread(uint32_t id, std::atomic<bool>& run_flag, TPCCStatistics& stats_ref)
@@ -1265,6 +1348,11 @@ public:
         if (connections.empty()) {
             throw std::runtime_error("Failed to establish any connections");
         }
+
+        // Initialize per-connection inflight counts
+        for (auto& conn : connections) {
+            connection_inflight_counts[conn.get()] = 0;
+        }
     }
     
     ~TPCCWorkerThread() {
@@ -1289,23 +1377,19 @@ public:
                 if (elapsed < tx_interval) {
                     // Not enough time has passed since last transaction
                     can_send = false;
-                    
                 }
-            }
-            
-            // Check inflight transaction limit
-            if (can_send && FLAGS_max_inflight > 0 && pending_transactions.size() >= FLAGS_max_inflight) {
-                can_send = false;
             }
             
             // Generate and send new transactions if allowed by rate limit
             if (can_send) {
-                for (size_t i = 0; i < connections.size() && 
-                     (FLAGS_max_inflight == 0 || pending_transactions.size() < FLAGS_max_inflight); i++) {
+                for (size_t i = 0; i < connections.size(); i++) {
                     auto& conn = connections[conn_index];
                     conn_index = (conn_index + 1) % connections.size();
                     
-                    if (conn->is_connected()) {
+                    // Check per-connection inflight limit instead of global limit
+                    if (conn->is_connected() && 
+                        (FLAGS_max_inflight == 0 || connection_inflight_counts[conn.get()] < FLAGS_max_inflight)) {
+                        
                         uint32_t request_id = next_request_id++;
                         bool success = false;
                         
@@ -1329,22 +1413,31 @@ public:
                             success = conn->send_transaction(request_id, tx_type, w_id, random_gen);
                         }
                         
-                        // Update last transaction time for rate limiting
-                        if (success && FLAGS_tx_rate > 0) {
-                            last_tx_time = std::chrono::high_resolution_clock::now();
-                            break; // Only send one transaction at a time when rate limiting
+                        // Update per-connection inflight count when transaction is sent
+                        if (success) {
+                            connection_inflight_counts[conn.get()]++;
+                            
+                            // Update last transaction time for rate limiting
+                            if (FLAGS_tx_rate > 0) {
+                                last_tx_time = std::chrono::high_resolution_clock::now();
+                                break; // Only send one transaction at a time when rate limiting
+                            }
                         }
                     }
                 }
             }
             
             // Check for responses
-            int num_events = epoll_wait(epoll_fd, events, MAX_EVENTS, 1000);
+            int num_events = epoll_wait(epoll_fd, events, MAX_EVENTS, 1);
             
             for (int i = 0; i < num_events; i++) {
                 TPCCConnection* conn = static_cast<TPCCConnection*>(events[i].data.ptr);
                 
                 if (events[i].events & EPOLLIN) {
+                    // Save the previous pending transaction count for this connection
+                    size_t prev_conn_pending = connection_inflight_counts[conn];
+                    size_t prev_total_pending = pending_transactions.size();
+                    
                     if (!conn->receive_responses(stats)) {
                         // Handle connection error - reconnect
                         epoll_ctl(epoll_fd, EPOLL_CTL_DEL, conn->get_fd(), nullptr);
@@ -1355,14 +1448,18 @@ public:
                         //     ev.data.ptr = conn;
                         //     epoll_ctl(epoll_fd, EPOLL_CTL_ADD, conn->get_fd(), &ev);
                         // }
+                    } else {
+                        // Update the per-connection inflight count based on processed responses
+                        size_t completed_txns = prev_total_pending - pending_transactions.size();
+                        if (completed_txns > 0) {
+                            // We can't directly know which connection's transactions completed,
+                            // so we assume it was for the current connection that received responses
+                            connection_inflight_counts[conn] = (completed_txns >= prev_conn_pending) ? 
+                                0 : prev_conn_pending - completed_txns;
+                        }
                     }
                 }
             }
-            
-            // Add a small sleep to prevent CPU spin if we have nothing to do
-            // if (!can_send && num_events == 0) {
-            //     std::this_thread::sleep_for(std::chrono::milliseconds(1));
-            // }
             
             // Update in-flight transaction count in statistics
             stats.set_inflight_count(pending_transactions.size());
@@ -1486,7 +1583,7 @@ void load_data_phase() {
             double rate = keys_loaded / elapsed;
             
             std::cout << "Loaded " << keys_loaded << " of " << FLAGS_load_keys << " keys (" 
-                      << std::fixed << std::setprecision(2) << (100.0 * keys_loaded / FLAGS_load_keys) << "%), "
+                      << std::fixed << std::setprecision(3) << (100.0 * keys_loaded / FLAGS_load_keys) << "%), "
                       << rate << " keys/sec, "
                       << "pipeline: " << pending_transactions.size() << std::endl;
                       
@@ -1547,7 +1644,7 @@ int main(int argc, char** argv) {
     std::cout << "Runtime: " << FLAGS_runtime << " seconds" << std::endl;
     
     if (FLAGS_max_inflight > 0) {
-        std::cout << "Max in-flight transactions: " << FLAGS_max_inflight << " per thread" << std::endl;
+        std::cout << "Max in-flight transactions: " << FLAGS_max_inflight << " per connection" << std::endl;
     } else {
         std::cout << "Max in-flight transactions: unlimited" << std::endl;
     }
@@ -1583,7 +1680,6 @@ int main(int argc, char** argv) {
     
     // Stop all threads
     running.store(false);
-    
     // Wait for worker threads to complete
     for (auto& thread : worker_threads) {
         if (thread.joinable()) {
@@ -1595,9 +1691,8 @@ int main(int argc, char** argv) {
     if (stats_thread.joinable()) {
         stats_thread.join();
     }
-    
     // Print final statistics
     stats.print_report(true);
-    
+
     return 0;
 }
