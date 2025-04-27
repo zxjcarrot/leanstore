@@ -12,7 +12,7 @@ enable_language(ASM)
 set(CMAKE_MODULE_PATH ${CMAKE_MODULE_PATH} "${CMAKE_SOURCE_DIR}/cmake/")
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -I/home/ubuntu/libtux/src -L/home/ubuntu/libtux/src -pthread -rdynamic -fno-omit-frame-pointer -g3 -static-libstdc++")
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -I/home/ubuntu/libtux/src -L/home/ubuntu/libtux/src -DTUX_PUSHDOWN -pthread -rdynamic -fno-omit-frame-pointer -g3 -static-libstdc++")
 
 # set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -pthread -rdynamic -fno-omit-frame-pointer -g3 -static-libstdc++")
 

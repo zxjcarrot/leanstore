@@ -387,7 +387,7 @@ public:
       delivery(w_id, carrier_id, currentTimestamp());
    }
    // -------------------------------------------------------------------------------------
-   void stockLevel(Integer w_id, Integer d_id, Integer threshold)
+   unsigned stockLevel(Integer w_id, Integer d_id, Integer threshold)
    {
       Integer o_id = district.lookupField({w_id, d_id}, &district_t::d_next_o_id);
 
@@ -423,11 +423,13 @@ public:
          auto res_s_quantity = stock.lookupField({w_id, i_id}, &stock_t::s_quantity);
          count += res_s_quantity < threshold;
       }
+
+      return count;
    }
    // -------------------------------------------------------------------------------------
-   void stockLevelRnd(Integer w_id) { stockLevel(w_id, urand(1, 10), urand(10, 20)); }
+   unsigned stockLevelRnd(Integer w_id) { stockLevel(w_id, urand(1, 10), urand(10, 20)); }
    // -------------------------------------------------------------------------------------
-   void orderStatusId(Integer w_id, Integer d_id, Integer c_id)
+   Integer orderStatusId(Integer w_id, Integer d_id, Integer c_id)
    {
       Varchar<16> c_first;
       Varchar<2> c_middle;
@@ -499,9 +501,10 @@ public:
                 // NOTHING
              });
       }
+      return o_id;
    }
    // -------------------------------------------------------------------------------------
-   void orderStatusName(Integer w_id, Integer d_id, Varchar<16> c_last)
+   Integer orderStatusName(Integer w_id, Integer d_id, Varchar<16> c_last)
    {
       vector<Integer> ids;
       customerwdl.scan(
@@ -516,7 +519,7 @@ public:
           [&]() { ids.clear(); });
       unsigned c_count = ids.size();
       if (c_count == 0)
-         return;  // TODO: rollback
+         return -1;  // TODO: rollback
       unsigned index = c_count / 2;
       if ((c_count % 2) == 0)
          index -= 1;
@@ -562,6 +565,7 @@ public:
           []() {
              // NOTHING
           });
+      return o_id;
    }
    // -------------------------------------------------------------------------------------
 

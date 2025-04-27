@@ -76,15 +76,20 @@ struct Partition {
    u64 next_pid;
    inline PID nextPID()
    {
-      std::unique_lock<std::mutex> g_guard(pids_mutex);
+      //std::unique_lock<std::mutex> g_guard(pids_mutex);
+      if (!pids_mutex.try_lock()) {
+         jumpmu::jump();
+      }
       if (freed_pids.size()) {
          const u64 pid = freed_pids.back();
          freed_pids.pop_back();
+         pids_mutex.unlock();
          return pid;
       } else {
          const u64 pid = next_pid;
          next_pid += pid_distance;
          ensure((pid * PAGE_SIZE / 1024 / 1024 / 1024) <= FLAGS_ssd_gib);
+         pids_mutex.unlock();
          return pid;
       }
    }

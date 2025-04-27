@@ -1,6 +1,6 @@
 #include "gflags/gflags.h"
 // -------------------------------------------------------------------------------------
-DEFINE_double(dram_gib, 8, "");
+DEFINE_double(dram_gib, 10, "");
 DEFINE_double(ssd_gib, 1700, "");
 DEFINE_uint32(free_pct, 1, "pct");
 DEFINE_uint32(partition_bits, 6, "bits per partition");

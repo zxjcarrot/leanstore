@@ -31,15 +31,20 @@ void FreeList::push(BufferFrame& bf)
 // -------------------------------------------------------------------------------------
 struct BufferFrame& FreeList::tryPop()
 {
-   JMUW<std::unique_lock<std::mutex>> guard(mutex);
+   //JMUW<std::unique_lock<std::mutex>> guard(mutex);
+   if (!mutex.try_lock()) {
+      jumpmu::jump();
+   }
    BufferFrame* free_bf = head;
    if (head == nullptr) {
+      mutex.unlock();
       jumpmu::jump();
    } else {
       head = head->header.next_free_bf;
       counter--;
       paranoid(free_bf->header.state == BufferFrame::STATE::FREE);
    }
+   mutex.unlock();
    return *free_bf;
 }
 // -------------------------------------------------------------------------------------

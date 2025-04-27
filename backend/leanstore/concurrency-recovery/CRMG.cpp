@@ -23,7 +23,7 @@ CRManager::CRManager(HistoryTreeInterface& versions_space, s32 ssd_fd, u64 end_o
    g_ssd_offset = end_of_block_device;
    ensure(workers_count < MAX_WORKER_THREADS);
    // -------------------------------------------------------------------------------------
-   Worker::global_workers_current_snapshot = std::make_unique<atomic<u64>[]>(workers_count);
+   Worker::global_workers_current_snapshot = std::make_unique<atomic<u64>[]>(workers_count * 10);
    // -------------------------------------------------------------------------------------
    worker_threads.reserve(workers_count);
    for (u64 t_i = 0; t_i < workers_count; t_i++) {
@@ -94,6 +94,16 @@ CRManager::CRManager(HistoryTreeInterface& versions_space, s32 ssd_fd, u64 end_o
 void CRManager::registerMeAsSpecialWorker()
 {
    cr::Worker::tls_ptr = new Worker(std::numeric_limits<WORKERID>::max(), workers, workers_count, versions_space, ssd_fd, true);
+}
+void CRManager::registerMeAsSpecialWorker(u16 worker_id)
+{
+   if (cr::Worker::tls_ptr) {
+      return;
+   }
+   static std::atomic<int> local_id{1};
+   int id_add = local_id.fetch_add(1);
+   //printf("Registering special worker %d\n", worker_id + id_add);
+   cr::Worker::tls_ptr = new Worker(worker_id + id_add, workers, workers_count, versions_space, ssd_fd, false);
 }
 // -------------------------------------------------------------------------------------
 void CRManager::scheduleJobSync(u64 t_i, std::function<void()> job)

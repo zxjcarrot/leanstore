@@ -38,16 +38,16 @@ Worker::Worker(u64 worker_id, Worker** all_workers, u64 workers_count, HistoryTr
       is_page_provider(is_page_provider)
 {
    Worker::tls_ptr = this;
-   CRCounters::myCounters().worker_id = worker_id;
+//   CRCounters::myCounters().worker_id = worker_id;
    logging.wal_buffer = reinterpret_cast<u8*>(std::aligned_alloc(512, FLAGS_wal_buffer_size));
    std::memset(logging.wal_buffer, 0, FLAGS_wal_buffer_size);
    if (!is_page_provider) {
-      cc.local_snapshot_cache = make_unique<u64[]>(workers_count);
-      cc.local_snapshot_cache_ts = make_unique<u64[]>(workers_count);
-      cc.local_workers_start_ts = make_unique<u64[]>(workers_count + 1);
+      cc.local_snapshot_cache = make_unique<u64[]>(workers_count + 1);
+      cc.local_snapshot_cache_ts = make_unique<u64[]>(workers_count + 1);
+      cc.local_workers_start_ts = make_unique<u64[]>(workers_count + 2);
       global_workers_current_snapshot[worker_id] = 0;
    }
-   cc.wt_pg.local_workers_tx_id = std::make_unique<std::atomic<TXID>[]>(workers_count);
+   cc.wt_pg.local_workers_tx_id = std::make_unique<std::atomic<TXID>[]>(workers_count + 1);
 }
 Worker::~Worker()
 {

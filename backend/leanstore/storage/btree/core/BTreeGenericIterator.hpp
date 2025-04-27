@@ -54,7 +54,7 @@ class BTreePessimisticIterator : public BTreePessimisticIteratorInterface
             u16 volatile level = 0;
             // -------------------------------------------------------------------------------------
             while (!target_guard->is_leaf) {
-               WorkerCounters::myCounters().dt_inner_page[btree.dt_id]++;
+               //WorkerCounters::myCounters().dt_inner_page[btree.dt_id]++;
                Swip<BTreeNode>* c_swip = nullptr;
                leaf_pos_in_parent = leaf->lowerBound<false>(key, key_length);
                if (leaf_pos_in_parent == leaf->count) {

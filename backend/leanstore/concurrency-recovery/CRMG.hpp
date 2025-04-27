@@ -51,6 +51,7 @@ class CRManager
    ~CRManager();
    // -------------------------------------------------------------------------------------
    void registerMeAsSpecialWorker();
+   void registerMeAsSpecialWorker(u16 worker_id);
    // -------------------------------------------------------------------------------------
    /**
     * @brief Schedule same job on specific amount of workers.

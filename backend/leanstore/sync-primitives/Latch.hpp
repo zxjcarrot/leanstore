@@ -8,6 +8,9 @@
 #include <unistd.h>
 #include <atomic>
 #include <shared_mutex>
+#ifdef TUX_PUSHDOWN
+#include <tux.h>
+#endif
 // -------------------------------------------------------------------------------------
 namespace leanstore
 {
@@ -110,6 +113,9 @@ struct Guard {
       if ((version & LATCH_EXCLUSIVE_BIT) == LATCH_EXCLUSIVE_BIT) {
          faced_contention = true;
          do {
+            #ifdef TUX_PUSHDOWN
+            libtux_yield();
+            #endif
             version = latch->ref().load();
          } while ((version & LATCH_EXCLUSIVE_BIT) == LATCH_EXCLUSIVE_BIT);
       }
@@ -130,7 +136,13 @@ struct Guard {
       assert(state == GUARD_STATE::UNINITIALIZED && latch != nullptr && state != GUARD_STATE::MOVED);
       version = latch->ref().load();
       if ((version & LATCH_EXCLUSIVE_BIT) == LATCH_EXCLUSIVE_BIT) {
-         latch->mutex.lock_shared();
+         if (!latch->mutex.try_lock_shared()) {
+            #ifdef TUX_PUSHDOWN
+            libtux_yield();
+            #endif
+            jumpmu::jump();
+         }
+         //latch->mutex.lock_shared();
          version = latch->ref().load();
          state = GUARD_STATE::SHARED;
          faced_contention = true;
@@ -143,7 +155,13 @@ struct Guard {
       assert(state == GUARD_STATE::UNINITIALIZED && latch != nullptr && state != GUARD_STATE::MOVED);
       version = latch->ref().load();
       if ((version & LATCH_EXCLUSIVE_BIT) == LATCH_EXCLUSIVE_BIT) {
-         latch->mutex.lock();
+         if (!latch->mutex.try_lock()) {
+            #ifdef TUX_PUSHDOWN
+            libtux_yield();
+            #endif
+            jumpmu::jump();
+         }
+         //latch->mutex.lock();
          version = latch->ref().load() + LATCH_EXCLUSIVE_BIT;
          latch->ref().store(version, std::memory_order_release);
          state = GUARD_STATE::EXCLUSIVE;
@@ -160,7 +178,13 @@ struct Guard {
       if (state == GUARD_STATE::OPTIMISTIC) {
          const u64 new_version = version + LATCH_EXCLUSIVE_BIT;
          u64 expected = version;
-         latch->mutex.lock();  // changed from try_lock because of possible retries b/c lots of readers
+         if (!latch->mutex.try_lock()) {
+            #ifdef TUX_PUSHDOWN
+            libtux_yield();
+            #endif
+            jumpmu::jump();
+         }
+         // latch->mutex.lock();  // changed from try_lock because of possible retries b/c lots of readers
          if (!latch->ref().compare_exchange_strong(expected, new_version)) {
             latch->mutex.unlock();
             jumpmu::jump();
@@ -168,7 +192,13 @@ struct Guard {
          version = new_version;
          state = GUARD_STATE::EXCLUSIVE;
       } else {
-         latch->mutex.lock();
+         if (!latch->mutex.try_lock()) {
+            #ifdef TUX_PUSHDOWN
+            libtux_yield();
+            #endif
+            jumpmu::jump();
+         }
+         //latch->mutex.lock();
          version = latch->ref().load() + LATCH_EXCLUSIVE_BIT;
          latch->ref().store(version, std::memory_order_release);
          state = GUARD_STATE::EXCLUSIVE;
@@ -180,7 +210,13 @@ struct Guard {
       if (state == GUARD_STATE::SHARED)
          return;
       if (state == GUARD_STATE::OPTIMISTIC) {
-         latch->mutex.lock_shared();
+         if (!latch->mutex.try_lock_shared()) {
+            #ifdef TUX_PUSHDOWN
+            libtux_yield();
+            #endif
+            jumpmu::jump();
+         }
+         //latch->mutex.lock_shared();
          if (latch->ref().load() != version) {
             latch->mutex.unlock_shared();
             jumpmu::jump();
@@ -198,6 +234,9 @@ struct Guard {
       const u64 new_version = version + LATCH_EXCLUSIVE_BIT;
       u64 expected = version;
       if (!latch->mutex.try_lock()) {
+         #ifdef TUX_PUSHDOWN
+         libtux_yield();
+         #endif
          jumpmu::jump();
       }
       if (!latch->ref().compare_exchange_strong(expected, new_version)) {
@@ -212,6 +251,9 @@ struct Guard {
    {
       assert(state == GUARD_STATE::OPTIMISTIC);
       if (!latch->mutex.try_lock_shared()) {
+         #ifdef TUX_PUSHDOWN
+         libtux_yield();
+         #endif
          jumpmu::jump();
       }
       if (latch->ref().load() != version) {

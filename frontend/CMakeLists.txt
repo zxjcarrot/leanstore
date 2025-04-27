@@ -24,6 +24,11 @@ add_executable(tpcc_server networked_leanstore_tpcc_server/tpcc_server.cpp)
 target_link_libraries(tpcc_server leanstore Threads::Threads)
 target_include_directories(tpcc_server PRIVATE ${SHARED_INCLUDE_DIRECTORY})
 
+add_executable(tux_tpcc_server networked_leanstore_tpcc_server/tpcc_server.cpp)
+target_link_libraries(tux_tpcc_server tux leanstore Threads::Threads)
+target_include_directories(tux_tpcc_server PRIVATE ${SHARED_INCLUDE_DIRECTORY})
+
+
 add_executable(tpcc_client networked_leanstore_tpcc_client/tpcc_client.cpp)
 target_link_libraries(tpcc_client leanstore Threads::Threads)
 target_include_directories(tpcc_client PRIVATE ${SHARED_INCLUDE_DIRECTORY})

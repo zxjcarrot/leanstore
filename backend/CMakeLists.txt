@@ -31,9 +31,9 @@ IF(PARANOID)
 ENDIF(PARANOID)
 # ---------------------------------------------------------------------------
 SET(COUNTERS_LEVEL "all" CACHE STRING "Which counters to leave in leanstore build")
-IF(COUNTERS_LEVEL STREQUAL "all")
-  target_compile_definitions(leanstore PUBLIC MACRO_COUNTERS_ALL)
-ENDIF()
+# IF(COUNTERS_LEVEL STREQUAL "all")
+#   target_compile_definitions(leanstore PUBLIC MACRO_COUNTERS_ALL)
+# ENDIF()
 
 SET(CHECKS_LEVEL "default" CACHE STRING "Which checks to leave in leanstore build")
 IF(CHECKS_LEVEL STREQUAL "default")
