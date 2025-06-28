@@ -285,7 +285,7 @@ private:
     std::atomic<uint64_t> total_tx{0};
     std::atomic<uint64_t> successful_tx{0};
     std::atomic<uint64_t> failed_tx{0};
-    std::atomic<uint64_t> tx_counts[7]{0}; // Count by transaction type
+    std::atomic<uint64_t> tx_counts[8]{0}; // Count by transaction type
     std::atomic<uint64_t> inflight_tx{0};  // Currently in-flight transactions
     
     std::mutex time_mutex;
@@ -298,12 +298,12 @@ private:
         std::vector<double> latencies;
     };
     
-    std::array<LatencyStats, 7> tx_latencies; // One for each transaction type
+    std::array<LatencyStats, 8> tx_latencies; // One for each transaction type
 
     std::atomic<uint64_t> total_request_bytes{0};
     std::atomic<uint64_t> total_response_bytes{0};
-    std::atomic<uint64_t> request_bytes_by_type[7]{0}; // Size by transaction type
-    std::atomic<uint64_t> response_bytes_by_type[7]{0}; // Size by transaction type
+    std::atomic<uint64_t> request_bytes_by_type[8]{0}; // Size by transaction type
+    std::atomic<uint64_t> response_bytes_by_type[8]{0}; // Size by transaction type
 // Add this to the TPCCStatistics class in the private section
 private:
     // Add a separate structure for aggregated latency stats
@@ -333,7 +333,7 @@ public:
         total_request_bytes = 0;
         total_response_bytes = 0;
         
-        for (int i = 0; i < 7; i++) {
+        for (int i = 0; i < 8; i++) {
             tx_counts[i] = 0;
             request_bytes_by_type[i] = 0;
             response_bytes_by_type[i] = 0;
@@ -407,11 +407,11 @@ public:
             std::cout << "Total transactions: " << total << "\n";
             std::cout << "Success rate: " << (total > 0 ? (100.0 * success / total) : 0) << "%\n";
             
-            const char* tx_names[] = {"Payment", "Order-Status", "Delivery", "Stock-Level", "New-Order", "KV-GET", "KV-PUT"};
+            const char* tx_names[] = {"Payment", "Order-Status", "Delivery", "Stock-Level", "New-Order", "KV-GET", "KV-PUT", "KV-SCAN"};
             std::cout << "Transaction mix:\n";
             
             if (total > 0) {
-                for (int i = 0; i < 7; i++) {
+                for (int i = 0; i < 8; i++) {
                     uint64_t count = tx_counts[i].load();
                     std::cout << "  " << tx_names[i] << ": " << count 
                               << " (" << (100.0 * count / total) << "%)\n";
@@ -439,9 +439,9 @@ public:
             std::cout << "  Average bandwidth: " << bandwidth_mbps << " MB/sec\n";
             
             std::cout << "\nDetailed Message Size Statistics by Transaction Type:\n";
-            const char* tx_names_detail[] = {"Payment", "Order-Status", "Delivery", "Stock-Level", "New-Order", "KV-GET", "KV-PUT"};
+            const char* tx_names_detail[] = {"Payment", "Order-Status", "Delivery", "Stock-Level", "New-Order", "KV-GET", "KV-PUT", "KV-SCAN"};
             
-            for (int i = 0; i < 7; i++) {
+            for (int i = 0; i < 8; i++) {
                 uint64_t count = tx_counts[i].load();
                 uint64_t req_bytes_type = request_bytes_by_type[i].load();
                 uint64_t resp_bytes_type = response_bytes_by_type[i].load();
@@ -487,7 +487,7 @@ private:
         return sorted_data[lower_idx] * (1 - weight) + sorted_data[upper_idx] * weight;
     }
     void print_latency_stats() {
-        const char* tx_names[] = {"Payment", "Order-Status", "Delivery", "Stock-Level", "New-Order", "KV-GET", "KV-PUT"};
+        const char* tx_names[] = {"Payment", "Order-Status", "Delivery", "Stock-Level", "New-Order", "KV-GET", "KV-PUT", "KV-SCAN"};
         std::cout << "\n==== LATENCY STATISTICS ====\n";
         
         // First print aggregate statistics for all transaction types combined
@@ -517,7 +517,7 @@ private:
         }
         
         // Then print individual transaction type statistics as before
-        for (int i = 0; i < 7; i++) {
+        for (int i = 0; i < 8; i++) {
             std::vector<double> latencies;
             {
                 std::lock_guard<std::mutex> lock(tx_latencies[i].mutex);
@@ -569,11 +569,11 @@ private:
             }
         }
         
-        const char* tx_names[] = {"Payment", "Order-Status", "Delivery", "Stock-Level", "New-Order", "KV-GET", "KV-PUT"};
+        const char* tx_names[] = {"Payment", "Order-Status", "Delivery", "Stock-Level", "New-Order", "KV-GET", "KV-PUT", "KV-SCAN"};
         bool first = true;
         
         // Then print individual transaction types
-        for (int i = 0; i < 7; i++) {
+        for (int i = 0; i < 8; i++) {
             std::vector<double> latencies;
             {
                 std::lock_guard<std::mutex> lock(tx_latencies[i].mutex);
@@ -1501,7 +1501,7 @@ public:
                     conn_index = (conn_index + 1) % connections.size();
                     
                     // Check per-connection inflight limit instead of global limit
-                    if (conn->is_connected() && 
+                    while (conn->is_connected() && 
                         (FLAGS_max_inflight == 0 || connection_inflight_counts[conn.get()] < FLAGS_max_inflight)) {
                         
                         uint32_t request_id = next_request_id++;
