@@ -50,6 +50,15 @@ add_executable(graveyard micro-benchmarks/graveyard.cpp)
 target_link_libraries(graveyard leanstore Threads::Threads)
 target_include_directories(graveyard PRIVATE ${SHARED_INCLUDE_DIRECTORY})
 
+# Stream vs Message Benchmark
+add_executable(stream_message_server stream_vs_message_server/server.cpp)
+target_link_libraries(stream_message_server tux leanstore Threads::Threads)
+target_include_directories(stream_message_server PRIVATE ${SHARED_INCLUDE_DIRECTORY})
+
+add_executable(stream_message_client stream_vs_message_client/client.cpp)
+target_link_libraries(stream_message_client tux leanstore Threads::Threads)
+target_include_directories(stream_message_client PRIVATE ${SHARED_INCLUDE_DIRECTORY})
+
 add_executable(queue micro-benchmarks/queue.cpp)
 target_link_libraries(queue leanstore Threads::Threads)
 target_include_directories(queue PRIVATE ${SHARED_INCLUDE_DIRECTORY})
